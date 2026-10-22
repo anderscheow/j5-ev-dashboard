@@ -1,0 +1,33 @@
+name: staging-check
+
+on:
+  push:
+    branches: [staging]
+  pull_request:
+    branches: [staging]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python tools/ci_check.py
+      - run: python tools/maintenance_selftest.py
+      - name: Build staging image
+        run: docker build -t tiggo-7-phev-staging .
+      - name: Smoke-test Railway port and catalogue
+        run: |
+          docker run -d --rm --name dashboard-staging-smoke -e CARLINKO_DEMO=1 -e PORT=8091 -p 127.0.0.1:8091:8091 tiggo-7-phev-staging
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8091/api/status > /dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent 'http://127.0.0.1:8091/api/maintenance-guide?country=MY&model=Jaecoo%20J5%20EV' | python -c 'import json,sys; data=json.load(sys.stdin); assert data["supported"] and data["next"] and len(data["available_models"]) == 25'
+      - if: always()
+        run: docker stop dashboard-staging-smoke || true

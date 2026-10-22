@@ -2197,7 +2197,7 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     ports = [a for a in sys.argv[1:] if a.isdigit()]       # ignore flags like --demo
-    port = int(ports[0]) if ports else 8088
+    port = int(ports[0]) if ports else int(os.environ.get("PORT", "8088"))
     if DEMO:
         print(f"CarLinko dashboard (DEMO — fake data) on http://0.0.0.0:{port}")
     else:

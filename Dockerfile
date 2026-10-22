@@ -14,4 +14,6 @@ EXPOSE 8088
 # Default = dashboard + logger in one container (single-service hosts like Railway;
 # writes /data/creds.json from $CREDS_JSON if set). docker-compose overrides this
 # per service (see docker-compose.yml), so compose behavior is unchanged.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/api/status' % os.environ.get('PORT', '8088'), timeout=3)"
 CMD ["bash", "railway_start.sh"]
