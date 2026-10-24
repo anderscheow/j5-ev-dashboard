@@ -182,6 +182,7 @@ def web_login(email, password, region="sea", gmaps_key=None, dashboard_password=
 # Reads the car's OWN vehicleControlConfig for the button set (generic per-car, not J5-hardcoded),
 # and forges the same POST /user/vehicle/remoteControl the app sends. Results arrive over the WS.
 _VEH_CACHE = {"t": 0.0, "v": None}
+_VEH_FETCH_LOCK = threading.Lock()
 
 def _read_token():
     import auth
@@ -197,18 +198,38 @@ def _vehicle_raw(force=False):
     """First vehicle object from /user/vehicle (carries vehicleControlConfig + remoteControls).
     Cached ~1h -- the control-capability set is a per-model constant, not live telemetry."""
     import auth, requests
-    if not force and _VEH_CACHE["v"] is not None and (time.time() - _VEH_CACHE["t"]) < 3600:
-        return _VEH_CACHE["v"]
-    def _fetch(t):
-        return requests.get(auth.api_base() + "/user/vehicle",
-                            headers=auth.headers_for({}, token=t), timeout=20).json()
-    d = _fetch(_read_token())
-    if str(d.get("code")) != "0000":
-        d = _fetch(auth.login())
-    data = d.get("data")
-    v = (data[0] if isinstance(data, list) and data else data) if data else {}
-    _VEH_CACHE["v"] = v or {}; _VEH_CACHE["t"] = time.time()
-    return _VEH_CACHE["v"]
+    with _VEH_FETCH_LOCK:
+        if not force and _VEH_CACHE["v"] is not None and (time.time() - _VEH_CACHE["t"]) < 3600:
+            return _VEH_CACHE["v"]
+
+        def _fetch(token):
+            response = requests.get(auth.api_base() + "/user/vehicle",
+                                    headers=auth.headers_for({}, token=token), timeout=20).json()
+            if not isinstance(response, dict) or str(response.get("code")) != "0000":
+                return None
+            data = response.get("data")
+            vehicle = data[0] if isinstance(data, list) and data else data
+            if not isinstance(vehicle, dict):
+                return None
+            config = vehicle.get("vehicleControlConfig")
+            if isinstance(config, str):
+                try: config = json.loads(config)
+                except (TypeError, ValueError): return None
+            return vehicle if isinstance(config, dict) and config else None
+
+        vehicle = _fetch(_read_token())
+        if vehicle is None:
+            # An expired CarLinko token can return code 0000 with data: [], so
+            # checking the response code alone leaves every control disabled.
+            try:
+                vehicle = _fetch(auth.login())
+            except Exception as exc:
+                raise RuntimeError("vehicle controls unavailable after token refresh") from exc
+        if vehicle is None:
+            raise RuntimeError("vehicle controls unavailable after token refresh")
+        _VEH_CACHE["v"] = vehicle
+        _VEH_CACHE["t"] = time.time()
+        return vehicle
 
 def control_caps():
     """What THIS car can be told to do, straight from CarLinko's vehicleControlConfig -- so the
