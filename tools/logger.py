@@ -256,6 +256,13 @@ def adaptive_loop(conn):
             st = poll_once(conn)
             conn.commit()
         except Exception as e:
+            # A failed commit leaves SQLite's write transaction open. Without
+            # rollback, every later poll and dashboard read can wait on the
+            # same lock until the service is restarted.
+            try:
+                conn.rollback()
+            except sqlite3.Error as rollback_error:
+                _failure("poll rollback failed", rollback_error)
             _failure("poll failed", e); st = None
         now = time.time()
         if st:
