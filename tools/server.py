@@ -1159,8 +1159,11 @@ def _summary():
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
+    finally:
+        conn.close()
     # decode authoritatively from the stored raw blob (offset fixes apply to all history)
     data = []
     for ts, dt, online, raw in rows:
@@ -1324,9 +1327,12 @@ def month_history(month):
     if not os.path.exists(DB):
         return empty
     conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT ts,dt,online,raw FROM telemetry WHERE ts >= ? AND ts < ? ORDER BY ts",
-        (t0, t1)).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT ts,dt,online,raw FROM telemetry WHERE ts >= ? AND ts < ? ORDER BY ts",
+            (t0, t1)).fetchall()
+    finally:
+        conn.close()
     data = []
     for ts, dt, online, raw in rows:
         if online != 1 or not raw:
