@@ -25,5 +25,15 @@ The compatibility implementation belongs on `feat/carlinko-device-endpoints`
 until it is merged. The maintainer release procedure is in
 `docs/releasing.md`; releases must start from the branch that contains the
 intended server code. Run `python3 tools/ci_check.py`,
-`python3 tools/status_selftest.py`, and `python3 tools/release_selftest.py`
-before tagging.
+`python3 tools/status_selftest.py`, `python3 tools/release_selftest.py`,
+`python3 tools/push_contract_selftest.py`, and
+`python3 tools/push_dispatcher_selftest.py` before tagging.
+
+Voltmoss push alerts (`push_alerts`) are opt-in per deployment and off by
+default. The dispatcher evaluates committed telemetry, never `GET
+/api/summary`, and judges each frame through `alert_summary()`, which shares
+its moving, charging, tyre and 12V helpers with `summary()`. A change to how
+`summary()` derives any of those must go through those helpers, or the two
+will disagree about an alert. `push_dispatcher_selftest.py` pins that parity
+on synthetic frames. The contract and deployment notes are in
+`docs/api-map.md` → "Voltmoss push binding".
