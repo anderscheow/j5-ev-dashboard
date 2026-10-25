@@ -52,7 +52,7 @@ if [ ! -x "$PY" ]; then
 fi
 if ! "$PY" -c 'import requests, websocket' 2>/dev/null; then
   echo "Installing requests + websocket-client ..."
-  "$PY" -m pip install --quiet requests websocket-client
+  "$PY" -m pip install --quiet requests websocket-client tzdata
 fi
 
 if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then

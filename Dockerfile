@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-RUN pip install --no-cache-dir requests websocket-client
+RUN pip install --no-cache-dir requests websocket-client tzdata
 
 COPY tools/ /app/tools/
 COPY web/  /app/web/
