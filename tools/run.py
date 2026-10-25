@@ -48,10 +48,25 @@ def run_logger(stop):
         stop.wait(15)
 
 
+def run_push_dispatcher(stop):
+    while not stop.is_set():
+        p = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "push_dispatcher.py")],
+                             cwd=HERE)
+        while p.poll() is None and not stop.is_set():
+            stop.wait(1)
+        if stop.is_set():
+            p.terminate()
+            return
+        print("[run] push dispatcher exited; restarting in 15 s", flush=True)
+        stop.wait(15)
+
+
 def main():
     stop = threading.Event()
     web = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "server.py"), PORT], cwd=HERE)
     threading.Thread(target=run_logger, args=(stop,), daemon=True).start()
+    if os.environ.get("VOLTMOSS_PUSH_DISPATCHER") == "1":
+        threading.Thread(target=run_push_dispatcher, args=(stop,), daemon=True).start()
     time.sleep(2)
     url = f"http://localhost:{PORT}"
     print(f"\n  Dashboard: {url}\n  Leave this window open. Ctrl+C to stop.\n", flush=True)

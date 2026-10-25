@@ -14,6 +14,10 @@ services:
       - "8088:8088"
     volumes:
       - ./data:/data
+    environment:
+      VOLTMOSS_PUSH_RELAY_URL: ${VOLTMOSS_PUSH_RELAY_URL:-}
+      VOLTMOSS_PUSH_HTTPS: ${VOLTMOSS_PUSH_HTTPS:-0}
+      VOLTMOSS_PUSH_DISPATCHER: ${VOLTMOSS_PUSH_DISPATCHER:-0}
     restart: unless-stopped
 
   logger:
@@ -22,4 +26,17 @@ services:
     command: python logger.py --adaptive
     volumes:
       - ./data:/data
+    restart: unless-stopped
+
+  push-dispatcher:
+    profiles: [push]
+    build: .
+    image: j5-ev-dashboard
+    command: python push_dispatcher.py
+    volumes:
+      - ./data:/data
+    environment:
+      VOLTMOSS_PUSH_RELAY_URL: ${VOLTMOSS_PUSH_RELAY_URL:-}
+      VOLTMOSS_PUSH_HTTPS: ${VOLTMOSS_PUSH_HTTPS:-0}
+      VOLTMOSS_PUSH_DISPATCHER: ${VOLTMOSS_PUSH_DISPATCHER:-0}
     restart: unless-stopped
