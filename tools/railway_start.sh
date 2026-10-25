@@ -18,4 +18,9 @@ elif [ ! -f "$DATA/creds.json" ]; then
 fi
 
 python logger.py --adaptive &
+if [ "${VOLTMOSS_PUSH_DISPATCHER:-0}" = "1" ]; then
+  # Restarted like tools/run.py does: a dead dispatcher only withdraws push_alerts from
+  # /api/status, which is safe but silent, so it must not stay dead until the next deploy.
+  (while true; do python push_dispatcher.py; echo "railway_start: push dispatcher exited; restarting in 15 s" >&2; sleep 15; done) &
+fi
 exec python server.py "${PORT:-8088}"

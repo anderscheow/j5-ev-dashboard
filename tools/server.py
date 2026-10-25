@@ -47,6 +47,26 @@ CAPABILITIES = (
     "service_centres",
 )
 
+# The operator explicitly enables the relay and asserts this dashboard is
+# reached through HTTPS. The app also checks its configured base URL. A public
+# ungated dashboard cannot enroll a device in a centrally operated service.
+def push_configured():
+    relay = os.environ.get("VOLTMOSS_PUSH_RELAY_URL", "").rstrip("/")
+    return (not DEMO and is_configured() and _gated() and
+            os.environ.get("VOLTMOSS_PUSH_HTTPS") == "1" and
+            os.environ.get("VOLTMOSS_PUSH_DISPATCHER") == "1" and
+            relay.startswith("https://") and not relay.startswith("https://localhost"))
+
+def push_enabled():
+    if not push_configured():
+        return False
+    import push_dispatcher
+    return push_dispatcher.healthy(PUSH_DB)
+
+def status_capabilities():
+    return (["maintenance_guide", "service_centres"] if DEMO else
+            [*CAPABILITIES, *(["push_alerts"] if push_enabled() else [])])
+
 _poll_lock = threading.Lock()
 
 def live_poll():
@@ -74,6 +94,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = ("--demo" in sys.argv) or (os.environ.get("CARLINKO_DEMO", "").lower() in ("1", "true", "yes"))
 _DATA = os.environ.get("CARLINKO_DATA") or HERE          # Docker data dir; else alongside the code
 DB   = os.path.join(_DATA, "carlinko.db") if os.environ.get("CARLINKO_DATA") else os.path.join(HERE, "..", "carlinko.db")
+PUSH_DB = os.path.join(_DATA, "push_alerts.db")
 WEB  = os.path.join(HERE, "..", "web")
 
 def _creds():
@@ -1139,6 +1160,91 @@ def demo_summary():
     lf["saved"] = max(0, round(lf["km"] * (PETROL_RP_L / PETROL_KM_L - out["insights"].get("rp_per_km", 0))))
     return out
 
+# The pieces of summary() that Voltmoss alerts read and that depend on more than the newest
+# frame. Shared with alert_summary() so the push dispatcher and /api/summary cannot disagree
+# about whether the car is moving, charging, on a bad tyre or a weak 12V battery.
+
+def _moving(data, now):
+    """Reliable "moving now": latest odometer rose vs the prior fresh frame (speed byte is garbage)."""
+    if len(data) >= 2:
+        (tsa, _, da), (tsb, _, db) = data[-2], data[-1]
+        oa, ob = da.get("odometer"), db.get("odometer")
+        if oa is not None and ob is not None and (now - tsb) < 120 and (tsb - tsa) < 120:
+            return ob > oa
+    return False
+
+def _last_tyre_frame(data):
+    """Newest (ts, dt, tyre bytes) carrying a real (non-FF) reading -- "last known good".
+    Sensors sleep when parked -> FF; keep showing the last live values + an as-of stamp."""
+    for ts2, dt2, dec2 in reversed(data):
+        tb = dec2.get("tyre")
+        if tb and any(x != 0xFF for x in tb):
+            return ts2, dt2, tb
+    return None
+
+def _tyre_fields(frame, latest_ts, now):
+    if frame is None:
+        return {}
+    ts2, dt2, tb = frame
+    # "psi" holds the value in the configured display unit; status logic below normalises to PSI
+    out = {"tpms": [{"pos": TPMS_POS[i], "psi": pressure(tb[i]), "temp": temp(tb[4 + i]),
+                     "valid": tb[i] != 0xFF} for i in range(4)],
+           "tpms_updated": dt2,
+           "tpms_age_min": round((now - ts2) / 60, 1),
+           "tpms_live": (ts2 == latest_ts),  # newest frame still has live tyres
+           # the undecoded bytes, so you can calibrate tpms_scale on a car that has real (direct)
+           # TPMS: read one wheel off the car's own screen, then tpms_scale = your_kPa / raw_byte.
+           "tpms_raw": [tb[i] for i in range(4)]}
+    raw_psi = [p for p in (_psi_raw(tb[i]) for i in range(4)) if p is not None]
+    if raw_psi:  # real per-wheel pressure present (J5: indirect TPMS, bytes stay FF; some cars send it)
+        out["tyre_indirect"] = False
+        out["tyre_status"] = "Check tyres" if any(p < 28 or p > 40 for p in raw_psi) else "Normal"
+    return out
+
+def _volt12_watch(data, now):
+    """12V battery watch (directly measured): 7-day min + status (readings are DC-DC-supported while awake)."""
+    v7 = [d2.get("volt12") for ts2, dt2, d2 in data if d2.get("volt12") and now - ts2 <= 7 * 86400]
+    if not v7:
+        return {}
+    mn = min(v7)
+    return {"volt12_min7d": round(mn, 2),
+            "volt12_status": "critical" if mn < 12.0 else ("low" if mn < 12.5 else "ok")}
+
+def _car_charging(dec):
+    """The car's own charging flags (b56/b57/b62-63), which beat the SoC-derived session detector:
+    the car flips to "active" the moment the charger starts, before any SoC tick (issue #5)."""
+    return dec.get("charge_state") == 1 and dec.get("charge_power") is not None
+
+# alert_summary() needs this much history before the frame it judges: the 12V watch reads
+# seven days, and no charge session that is still ongoing started earlier than that.
+ALERT_WINDOW = 7 * 86400
+
+def alert_summary(data, now, tyre_frame=None):
+    """The alert-relevant subset of summary(), as of the newest frame in `data`.
+
+    data = [(ts, dt, decoded)] for online frames, oldest first, covering ALERT_WINDOW before
+    the newest. tyre_frame is the last-known-good tyre reading from before the window, used only
+    when the window holds none. Bounded so the push dispatcher can judge each new frame without
+    re-decoding the whole history, which summary() does and which grows without limit."""
+    if not data:
+        return None
+    ts, dt, dec = data[-1]
+    fr = [(t, d.get("battery"), d.get("odometer")) for t, _, d in data
+          if d.get("battery") is not None and d.get("odometer") is not None]
+    out = {"vehicle": _vehicle(), "updated": dt, "battery": dec.get("battery"),
+           "odometer": dec.get("odometer"), "volt12": dec.get("volt12"),
+           "unlocked": dec.get("unlocked"), "doors": dec.get("doors"),
+           "trunk_open": dec.get("trunk_open"), "windows": dec.get("windows"),
+           "sunroof_open": dec.get("sunroof_open"), "moving": _moving(data, now),
+           "charging": {"active": _car_charging(dec) or
+                        any(s["ongoing"] for s in build_sessions(fr, now))},
+           "tyre_unit": TYRE_UNIT, "tyre_status": "Normal", "tyre_indirect": True,
+           "tpms": [{"pos": p, "psi": None, "temp": None, "valid": False} for p in TPMS_POS],
+           "volt12_status": None}
+    out.update(_tyre_fields(_last_tyre_frame(data) or tyre_frame, ts, now))
+    out.update(_volt12_watch(data, now))
+    return out
+
 def summary():
     """Public /api/summary payload.
 
@@ -1217,31 +1323,9 @@ def _summary():
                        # EV + fuel on every capture (742 = 90 + 652, 687 = 38 + 649), so we compute
                        # it and the UI labels it as computed rather than read from the car.
                        "total_range_km": (ev + fr) if (ev is not None and fr is not None) else None}
-    # reliable "moving now": latest odometer rose vs the prior fresh frame (speed byte is garbage)
-    if len(data) >= 2:
-        (tsa, _, da), (tsb, _, db) = data[-2], data[-1]
-        oa, ob = da.get("odometer"), db.get("odometer")
-        if oa is not None and ob is not None and (time.time() - tsb) < 120 and (tsb - tsa) < 120:
-            out["moving"] = ob > oa
-    # tyres: hold the last frame that carried a real (non-FF) reading ("last known good").
-    # Sensors sleep when parked -> FF; keep showing the last live values + an as-of stamp.
-    for ts2, dt2, dec2 in reversed(data):
-        tb = dec2.get("tyre")
-        if tb and any(x != 0xFF for x in tb):
-            # "psi" holds the value in the configured display unit; status logic below normalises to PSI
-            out["tpms"] = [{"pos": TPMS_POS[i], "psi": pressure(tb[i]), "temp": temp(tb[4 + i]),
-                            "valid": tb[i] != 0xFF} for i in range(4)]
-            out["tpms_updated"] = dt2
-            out["tpms_age_min"] = round((time.time() - ts2) / 60, 1)
-            out["tpms_live"] = (ts2 == ts)  # newest frame still has live tyres
-            # the undecoded bytes, so you can calibrate tpms_scale on a car that has real (direct)
-            # TPMS: read one wheel off the car's own screen, then tpms_scale = your_kPa / raw_byte.
-            out["tpms_raw"] = [tb[i] for i in range(4)]
-            raw_psi = [p for p in (_psi_raw(tb[i]) for i in range(4)) if p is not None]
-            if raw_psi:  # real per-wheel pressure present (J5: indirect TPMS, bytes stay FF; some cars send it)
-                out["tyre_indirect"] = False
-                out["tyre_status"] = "Check tyres" if any(p < 28 or p > 40 for p in raw_psi) else "Normal"
-            break
+    now = time.time()
+    out["moving"] = _moving(data, now)
+    out.update(_tyre_fields(_last_tyre_frame(data), ts, now))
 
     # Daily distance comes from trips, each bucketed by the day it STARTED: a drive that crosses
     # midnight (23:45 -> 00:30) stays one trip on the day it began, so "today" only ever shows
@@ -1297,7 +1381,7 @@ def _summary():
     out["charging"]["mode"] = {16: "dc", 1: "ac"}.get(cmode)
     out["charging"]["state"] = cstate
     out["charging"]["remaining_min"] = dec.get("charge_remain")
-    if cstate == 1 and dec.get("charge_power") is not None:
+    if _car_charging(dec):
         out["charging"]["active"] = True
         out["charging"]["rate_kw"] = dec["charge_power"]
         out["charging"]["rate_source"] = "car"
@@ -1311,12 +1395,7 @@ def _summary():
     out["lifetime"] = res.get("lifetime", {})
     out["battery_care"] = res.get("battery_care", {})
     out["drain"] = parked_drain(data)                  # SoC lost across offline/parked gaps
-    # 12V battery watch (directly measured): 7-day min + status (readings are DC-DC-supported while awake)
-    v7 = [d2.get("volt12") for ts2, dt2, d2 in data if d2.get("volt12") and time.time() - ts2 <= 7 * 86400]
-    if v7:
-        mn = min(v7)
-        out["volt12_min7d"] = round(mn, 2)
-        out["volt12_status"] = "critical" if mn < 12.0 else ("low" if mn < 12.5 else "ok")
+    out.update(_volt12_watch(data, now))
     out["insights"] = insights(out)
     lf = out.get("lifetime") or {}                     # saved-vs-petrol over distance actually driven
     rpkm_l = out["insights"].get("rp_per_km")
@@ -1827,6 +1906,8 @@ class H(BaseHTTPRequestHandler):
         super().send_error(code, message, explain)
     def _send(self, code, body, ctype, extra=None):
         path = self.path.split("?", 1)[0]
+        logged_path = ("/api/push/installations/{id}"
+                       if path.startswith("/api/push/installations/") else path)
         failed = False
         if path.startswith("/api/") and "json" in ctype:
             try:
@@ -1835,7 +1916,7 @@ class H(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 pass
         level = logging.ERROR if code >= 500 else logging.WARNING if code >= 400 or failed else logging.INFO
-        LOG.log(level, "%s %r -> %d%s", self.command, path, code,
+        LOG.log(level, "%s %r -> %d%s", self.command, logged_path, code,
                 " (application failure)" if failed and code < 400 else "")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -1861,7 +1942,7 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"configured": is_configured(), "gated": _gated(),
                                         "authed": self._authed(),
                                         "api_version": API_VERSION,
-                                        "capabilities": ["maintenance_guide", "service_centres"] if DEMO else CAPABILITIES}).encode(),
+                                        "capabilities": status_capabilities()}).encode(),
                        "application/json")
             return
         if _gated() and not self._authed() and path not in self._PUBLIC:
@@ -1870,6 +1951,15 @@ class H(BaseHTTPRequestHandler):
                     self._send(200, f.read(), "text/html; charset=utf-8")
                 return
             self._send(401, b'{"error":"locked"}', "application/json")
+            return
+        if path == "/api/push/status":
+            if not push_configured():
+                self._send(200, b'{"enabled":false,"registered_count":0}', "application/json")
+                return
+            import push_registrations as push
+            self._send(200, json.dumps({"enabled": push_enabled(),
+                                        "registered_count": push.count(PUSH_DB)}).encode(),
+                       "application/json")
             return
         if path == "/api/summary":
             self._send(200, json.dumps(summary()).encode(), "application/json")
@@ -2055,6 +2145,54 @@ class H(BaseHTTPRequestHandler):
                  "svg": "image/svg+xml", "png": "image/png"}.get(fp.rsplit(".", 1)[-1], "text/plain")
         with open(fp, "rb") as f:
             self._send(200, f.read(), ctype + ("; charset=utf-8" if ctype.startswith("text") or "manifest" in ctype or ctype.endswith("svg+xml") else ""))
+
+    def do_PUT(self):
+        path = self.path.split("?", 1)[0]
+        prefix = "/api/push/installations/"
+        if not path.startswith(prefix) or "/" in path[len(prefix):]:
+            self._send(404, b'{"error":"not found"}', "application/json"); return
+        if not push_enabled():
+            self._send(404, b'{"error":"push unavailable"}', "application/json"); return
+        if not valid_session(_cookie_sid(self.headers.get("Cookie"))):
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 4096:
+                raise ValueError("invalid body size")
+            import push_registrations as push
+            binding = push.validate(path[len(prefix):], json.loads(self.rfile.read(n)))
+            push.put(PUSH_DB, binding)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            self._send(400, json.dumps({"error": str(e)[:120]}).encode(), "application/json")
+            return
+        except Exception as e:
+            _log_exception("push registration failed", e)
+            self._send(500, b'{"error":"registration failed"}', "application/json")
+            return
+        self._send(200, json.dumps({"ok": True,
+                                    "installation_id": binding["installation_id"]}).encode(),
+                   "application/json")
+
+    def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        prefix = "/api/push/installations/"
+        if not path.startswith(prefix) or "/" in path[len(prefix):]:
+            self._send(404, b'{"error":"not found"}', "application/json"); return
+        # Revocation stays available if the worker has stopped after signup.
+        if not push_configured():
+            self._send(404, b'{"error":"push unavailable"}', "application/json"); return
+        if not valid_session(_cookie_sid(self.headers.get("Cookie"))):
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        import push_registrations as push
+        installation_id = path[len(prefix):]
+        if not push.valid_id(installation_id):
+            self._send(400, b'{"error":"invalid installation ID"}', "application/json"); return
+        try:
+            push.delete(PUSH_DB, installation_id)
+        except Exception as e:
+            _log_exception("push deletion failed", e)
+            self._send(500, b'{"error":"deletion failed"}', "application/json"); return
+        self._send(200, b'{"ok":true}', "application/json")
 
     def do_POST(self):
         path = self.path.split("?")[0]

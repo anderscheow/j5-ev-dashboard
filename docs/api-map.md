@@ -164,6 +164,7 @@ account settings remain unavailable.
 | `charge_schedule` | `POST /api/chargeschedule` writes scheduled charging; current schedule reads back through `/api/settings`. |
 | `scheduled_travel` | `POST /api/scheduledtravel` writes advance travel; current schedule reads back through `/api/settings`. |
 | `vehicle_alerts` | `GET /api/alertconfig` and `POST /api/alertconfig` read/write the two supported alert switches; `/api/settings` also exposes them. |
+| `push_alerts` | `GET /api/push/status`, `PUT /api/push/installations/{installation_id}`, and `DELETE /api/push/installations/{installation_id}` manage Voltmoss remote-alert bindings. Advertised only when the dashboard is configured, password-gated, and explicitly configured for a HTTPS relay and HTTPS public access. This is separate from CarLinko's `vehicle_alerts`. |
 | `climate_settings` | `POST /api/actemp` sets a supported A/C temperature and `POST /api/airduration` sets 5, 10 or 15 minutes; current duration reads back through `/api/controls`. |
 | `climate_seats` | `POST /api/seat` applies a supported seat heat/vent level after checking the car's capabilities. |
 | `maintenance_guide` | `GET /api/maintenance-guide` returns the country and model timetable, completed milestones, and next due service. |
@@ -175,6 +176,84 @@ means version 0, as on `/api/summary`. Clients should ignore IDs
 they do not know and use feature-specific errors if a claimed operation fails. Adding a new
 capability ID is additive and does not bump `api_version`; a breaking `/api/summary` shape change
 does. A release must record any new IDs in this table.
+
+### Voltmoss push binding (optional)
+
+Set `VOLTMOSS_PUSH_RELAY_URL` to the operator's HTTPS relay URL and
+`VOLTMOSS_PUSH_HTTPS=1` only when the dashboard's public address is HTTPS.
+Set `VOLTMOSS_PUSH_DISPATCHER=1` only after the dispatcher is deployed and
+running; the status capability checks the dispatcher's live lease and is absent
+when the worker is stopped. The dispatcher watches committed telemetry rows,
+persists per-phone alert memory and a retry outbox in `push_alerts.db`, and
+sends only event kind/value/ID/timestamp to the relay. It never sends a push
+from `GET /api/summary`. A frame older than two minutes is not announced.
+The relay rejects events more than fifteen minutes old.
+
+On Railway, `tools/railway_start.sh` starts one dispatcher beside the logger
+and web server when the flag is `1`; keep a persistent `/data` volume for
+`push_alerts.db`. With Docker Compose, set the three variables on the web and
+dispatcher services, then start `docker compose --profile push up -d` so the
+single `push-dispatcher` service runs. A plain `tools/run.py` launch also starts
+it when enabled. Do not start two dispatchers against the same data volume;
+the SQLite lease is a recovery guard, not an instruction to scale it out.
+Configure a dashboard password. Without all three, `/api/status` omits
+`push_alerts`, `GET /api/push/status` answers `enabled:false`, and writes are
+unavailable. The client must also refuse a non-HTTPS dashboard URL. The relay
+and dispatcher are separate components; enabling the capability requires both
+to be deployed and working. Do not distribute the relay's Firebase send
+credential to dashboard installations.
+
+`GET /api/push/status` returns `{"enabled":true,"registered_count":N}` to an
+unlocked session. `PUT /api/push/installations/{installation_id}` is an
+idempotent registration; `DELETE` removes it and answers `{"ok":true}` even
+when already absent. The ID is an opaque relay-issued 16–64 character URL-safe
+string. The body is at most 4096 bytes:
+
+```json
+{
+  "sender_secret": "64 lowercase or uppercase hex characters",
+  "rules": {"v": 1, "rules": {"soc_below": {"on": true, "t": 20}}},
+  "locale": "en",
+  "service": {"last_odo": null, "last_date": null, "interval_km": null, "interval_months": null},
+  "plus": true,
+  "time_zone": "Asia/Kuala_Lumpur"
+}
+```
+
+`sender_secret` is the relay-issued, per-installation event credential. The
+dashboard stores it on its own data volume but never echoes or logs it. Rule
+keys are `charge_complete`, `charge_stopped`, `soc_below`, `left_unlocked`,
+`panel_open`, `tyre_pressure`, `volt12_low`, and `service_due`; only enabled
+rules appear. The only threshold presets are 80/90/100 for charge completion
+and 10/20/30 for low SoC. Supported locales are `en`, `ms`, `id`, `zh`.
+`plus` is client-reported, matching the current widget gate; it is not receipt
+verification. Writes require a valid password-gated `sid` session and return
+401 when locked, 400 for malformed data, or 404 when the push capability is
+disabled. No FCM installation ID, car identifier, or Firebase credential is
+sent to this endpoint. The sender secret must travel only over HTTPS.
+`service.last_date` is a real calendar date in `YYYY-MM-DD` form, not a
+timestamp; the app must serialize its service date without UTC conversion so
+the day does not shift at a timezone boundary. `time_zone` is the phone's IANA
+zone ID (for example `Asia/Kuala_Lumpur`, never an offset or abbreviation). The
+service reminder counts days to the due date on the phone's calendar, so the
+dispatcher evaluates it in that zone rather than the dashboard's; a Railway
+container runs on UTC and would otherwise move the reminder by a day near
+midnight. All six fields are required.
+
+The dispatcher judges each fresh frame from the frame itself plus the seven
+days before it (the 12V watch's span; no charge still in progress started
+earlier), not by recomputing `summary()` over the whole history. It derives
+moving, charging, tyre and 12V state through the same helpers `summary()` uses,
+so the two cannot disagree about an alert condition. A relay send that is slow
+cannot leave two dispatchers running: the lease is renewed before every frame
+and every send, and a worker that finds it taken stops.
+
+A phone revokes its binding at the relay, which it can always reach, when it
+signs out, switches server, or turns alerts or notifications off. The next event
+for that installation then gets a 401 or 404 from the relay, and the dispatcher
+deletes the binding and its queued events rather than retrying. Time-zone
+validation uses Python's `zoneinfo`; the image installs the `tzdata` package so
+it does not depend on the base image shipping a system time-zone database.
 
 ---
 
