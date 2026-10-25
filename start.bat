@@ -21,7 +21,7 @@ if not defined PY (
 %PY% -c "import requests, websocket" >nul 2>nul
 if errorlevel 1 (
   echo First run: installing the two small libraries it needs...
-  %PY% -m pip install --quiet requests websocket-client
+  %PY% -m pip install --quiet requests websocket-client tzdata
   if errorlevel 1 (
     echo.
     echo Install failed. Check your internet connection and try again.
