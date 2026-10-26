@@ -1,12 +1,13 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-RUN pip install --no-cache-dir requests websocket-client
+RUN pip install --no-cache-dir requests websocket-client tzdata
 
 COPY tools/ /app/tools/
 COPY web/  /app/web/
 
 ENV CARLINKO_DATA=/data
+ENV PYTHONUNBUFFERED=1
 # no VOLUME instruction: docker-compose mounts ./data:/data, Railway attaches its own volume
 WORKDIR /app/tools
 EXPOSE 8088

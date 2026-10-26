@@ -12,9 +12,9 @@
 #                                        for http(s) remotes (leave unset for ssh remotes)
 #   CARLINKO_SERVICES="carlinko-web carlinko-logger"   force-restart exactly these units
 #
-# server.py imports auth + known_cars; logger.py imports auth. A logger restart drops its single
-# CarLinko WebSocket session, so it is left alone unless it has to change. Web-only edits are served
-# from disk and need no restart.
+# server.py imports auth + known_cars + log_setup; logger.py imports auth + log_setup. A logger
+# restart drops its single CarLinko WebSocket session, so it is left alone unless it has to change.
+# Web-only edits are served from disk and need no restart.
 set -euo pipefail
 
 # Everything lives in main() and the file ends with `exit`: `git merge` below can replace this very
@@ -63,8 +63,8 @@ main() {
     services="$CARLINKO_SERVICES"
   else
     services=""
-    grep -Eq '^tools/(server|auth|known_cars)\.py$' <<<"$changed" && services="carlinko-web"
-    grep -Eq '^tools/(logger|auth)\.py$' <<<"$changed" && services="$services carlinko-logger"
+    grep -Eq '^tools/(server|auth|known_cars|log_setup)\.py$' <<<"$changed" && services="carlinko-web"
+    grep -Eq '^tools/(logger|auth|log_setup)\.py$' <<<"$changed" && services="$services carlinko-logger"
     services="${services# }"
   fi
   if [ -n "$services" ]; then

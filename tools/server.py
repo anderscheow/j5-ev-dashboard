@@ -3,10 +3,22 @@ Serves the mobile PWA in ./web and a JSON API computed from carlinko.db.
 Run: python server.py [port]   (default 8088, binds 0.0.0.0 so Tailscale can reach it)
 """
 import os, sys, json, time, sqlite3, threading, math, calendar, urllib.request, urllib.parse
+import logging, traceback
 import hmac, hashlib, base64, secrets, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import known_cars          # per-model constants the telemetry never carries (pack size, tyre scale)
+import log_setup
 import maintenance
+
+log_setup.configure()
+LOG = logging.getLogger("carlinko.server")
+
+def _log_exception(context, exc, level=logging.ERROR):
+    """Log the failure location without exception text, which may contain credentials."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = "%s:%s in %s" % (os.path.basename(frames[-1].filename), frames[-1].lineno,
+                              frames[-1].name) if frames else "unknown location"
+    LOG.log(level, "%s: %s at %s", context, type(exc).__name__, where)
 
 # Version of the /api/summary contract, stamped onto every payload as "api_version".
 #
@@ -18,6 +30,40 @@ import maintenance
 # Clients should treat an api_version they do not recognise as "newer than me" and degrade rather
 # than guess, and should treat a missing api_version as version 0 (any build before 2026-09-11).
 API_VERSION = 1
+
+# Stable operation IDs advertised by /api/status. These describe server code,
+# not whether a particular vehicle or CarLinko account supports an operation.
+CAPABILITIES = (
+    "settings_read",
+    "target_soc",
+    "charge_schedule",
+    "scheduled_travel",
+    "vehicle_alerts",
+    "climate_settings",
+    "climate_seats",
+    "maintenance_guide",
+    "service_centres",
+)
+
+# The operator explicitly enables the relay and asserts this dashboard is
+# reached through HTTPS. The app also checks its configured base URL. A public
+# ungated dashboard cannot enroll a device in a centrally operated service.
+def push_configured():
+    relay = os.environ.get("VOLTMOSS_PUSH_RELAY_URL", "").rstrip("/")
+    return (not DEMO and is_configured() and _gated() and
+            os.environ.get("VOLTMOSS_PUSH_HTTPS") == "1" and
+            os.environ.get("VOLTMOSS_PUSH_DISPATCHER") == "1" and
+            relay.startswith("https://") and not relay.startswith("https://localhost"))
+
+def push_enabled():
+    if not push_configured():
+        return False
+    import push_dispatcher
+    return push_dispatcher.healthy(PUSH_DB)
+
+def status_capabilities():
+    return (["maintenance_guide", "service_centres"] if DEMO else
+            [*CAPABILITIES, *(["push_alerts"] if push_enabled() else [])])
 
 _poll_lock = threading.Lock()
 
@@ -35,6 +81,7 @@ def live_poll():
             conn.close()
         return (st is not None), ("ok" if st else "car offline")
     except Exception as e:
+        _log_exception("live poll failed", e)
         return False, repr(e)
     finally:
         _poll_lock.release()
@@ -45,11 +92,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = ("--demo" in sys.argv) or (os.environ.get("CARLINKO_DEMO", "").lower() in ("1", "true", "yes"))
 _DATA = os.environ.get("CARLINKO_DATA") or HERE          # Docker data dir; else alongside the code
 DB   = os.path.join(_DATA, "carlinko.db") if os.environ.get("CARLINKO_DATA") else os.path.join(HERE, "..", "carlinko.db")
+PUSH_DB = os.path.join(_DATA, "push_alerts.db")
 WEB  = os.path.join(HERE, "..", "web")
 
 def _creds():
     try:
-        return json.load(open(os.path.join(_DATA, "creds.json")))
+        with open(os.path.join(_DATA, "creds.json")) as f:
+            return json.load(f)
     except Exception:
         return {}
 
@@ -67,16 +116,18 @@ def _ensure_db():
     try:
         import logger as L
         conn = sqlite3.connect(DB); conn.executescript(L.SCHEMA); conn.commit(); conn.close()
-    except Exception:
-        pass
-# Vehicle identity (plate/model/VIN) comes from creds.json; the client hides plate+VIN by
-# default (eye-toggle reveals). Falls back to generic labels so the app still runs unconfigured.
-_V = (_creds().get("vehicle") or {})
-VEHICLE = {"plate": _V.get("plate") or "—", "model": _V.get("model") or "EV", "vin": _V.get("vin") or "—"}
+    except Exception as e:
+        _log_exception("database initialization failed", e)
+def _vehicle():
+    """Vehicle identity (plate/model/VIN) from creds.json, read fresh so a web login, a setup.py
+    run or a restored creds.json shows up without a restart. The client hides plate+VIN by
+    default (eye-toggle reveals). Falls back to generic labels so the app still runs unconfigured."""
+    v = _creds().get("vehicle") or {}
+    return {"plate": v.get("plate") or "—", "model": v.get("model") or "EV", "vin": v.get("vin") or "—"}
+
 # CarLinko hosts a render of the exact car (model + colour) on its own CDN; setup.py saves the URL.
 # We proxy it through /car-photo and cache it on disk rather than pointing the browser at the
 # vendor's CDN -- keeps the dashboard self-hosted and offline-friendly, and leaks no referer.
-VEHICLE_IMG = (_V.get("img") or "").strip() or None
 _CAR_PHOTO = os.path.join(_DATA, "car-photo.img")
 _CAR_PHOTO_MAX = 8 * 1024 * 1024                       # same cap as the CarLinko fetch below
 TPMS_POS = ["FL", "FR", "RL", "RR"]
@@ -99,7 +150,8 @@ def _vehicle_img_url(v):
     try:
         img = json.loads(v.get("vehicleImgConfig") or "{}")
         return img.get("Front") or img.get("Side") or img.get("Top")
-    except Exception:
+    except Exception as e:
+        _log_exception("vehicle image configuration is invalid", e, logging.WARNING)
         return None
 
 def is_configured():
@@ -137,7 +189,6 @@ def web_login(email, password, region="sea", gmaps_key=None, dashboard_password=
         json.dump(c, open(cpath, "w"), indent=2)
         try: os.chmod(cpath, 0o600)
         except Exception: pass
-        VEHICLE.update(c["vehicle"])                        # reflect immediately, no restart
     if dashboard_password and dashboard_password.strip():
         set_dashboard_password(dashboard_password.strip())  # gate the dashboard for public hosting
     _ensure_db()                                           # table exists before the dashboard first loads
@@ -150,6 +201,7 @@ def web_login(email, password, region="sea", gmaps_key=None, dashboard_password=
 # Reads the car's OWN vehicleControlConfig for the button set (generic per-car, not J5-hardcoded),
 # and forges the same POST /user/vehicle/remoteControl the app sends. Results arrive over the WS.
 _VEH_CACHE = {"t": 0.0, "v": None}
+_VEH_FETCH_LOCK = threading.Lock()
 
 def _read_token():
     import auth
@@ -165,18 +217,38 @@ def _vehicle_raw(force=False):
     """First vehicle object from /user/vehicle (carries vehicleControlConfig + remoteControls).
     Cached ~1h -- the control-capability set is a per-model constant, not live telemetry."""
     import auth, requests
-    if not force and _VEH_CACHE["v"] is not None and (time.time() - _VEH_CACHE["t"]) < 3600:
-        return _VEH_CACHE["v"]
-    def _fetch(t):
-        return requests.get(auth.api_base() + "/user/vehicle",
-                            headers=auth.headers_for({}, token=t), timeout=20).json()
-    d = _fetch(_read_token())
-    if str(d.get("code")) != "0000":
-        d = _fetch(auth.login())
-    data = d.get("data")
-    v = (data[0] if isinstance(data, list) and data else data) if data else {}
-    _VEH_CACHE["v"] = v or {}; _VEH_CACHE["t"] = time.time()
-    return _VEH_CACHE["v"]
+    with _VEH_FETCH_LOCK:
+        if not force and _VEH_CACHE["v"] is not None and (time.time() - _VEH_CACHE["t"]) < 3600:
+            return _VEH_CACHE["v"]
+
+        def _fetch(token):
+            response = requests.get(auth.api_base() + "/user/vehicle",
+                                    headers=auth.headers_for({}, token=token), timeout=20).json()
+            if not isinstance(response, dict) or str(response.get("code")) != "0000":
+                return None
+            data = response.get("data")
+            vehicle = data[0] if isinstance(data, list) and data else data
+            if not isinstance(vehicle, dict):
+                return None
+            config = vehicle.get("vehicleControlConfig")
+            if isinstance(config, str):
+                try: config = json.loads(config)
+                except (TypeError, ValueError): return None
+            return vehicle if isinstance(config, dict) and config else None
+
+        vehicle = _fetch(_read_token())
+        if vehicle is None:
+            # An expired CarLinko token can return code 0000 with data: [], so
+            # checking the response code alone leaves every control disabled.
+            try:
+                vehicle = _fetch(auth.login())
+            except Exception as exc:
+                raise RuntimeError("vehicle controls unavailable after token refresh") from exc
+        if vehicle is None:
+            raise RuntimeError("vehicle controls unavailable after token refresh")
+        _VEH_CACHE["v"] = vehicle
+        _VEH_CACHE["t"] = time.time()
+        return vehicle
 
 def control_caps():
     """What THIS car can be told to do, straight from CarLinko's vehicleControlConfig -- so the
@@ -371,7 +443,8 @@ def _latest_body_state():
             return None
         d = decode(row[0])
         return {k: d.get(k) for k in _STATE_KEYS}
-    except Exception:
+    except Exception as e:
+        _log_exception("reading latest vehicle state failed", e)
         return None
 
 def _opcode_expect(op):
@@ -391,8 +464,8 @@ def control_and_confirm(op, timeout=20, wake=True, settle=18.0):
     if wake and not DEMO:
         try:
             send_control("77", 10); time.sleep(0.6)
-        except Exception:
-            pass
+        except Exception as e:
+            _log_exception("control wake command failed", e, logging.WARNING)
     d = send_control(op, timeout)
     res = {**control_result(op, d), "state_before": before, "expect": _opcode_expect(op)}
     if not res["ok"]:
@@ -434,7 +507,8 @@ def _gated():
 
 def _save_creds(c):
     cpath = os.path.join(_DATA, "creds.json")
-    json.dump(c, open(cpath, "w"), indent=2)
+    with open(cpath, "w") as f:
+        json.dump(c, f, indent=2)
     try: os.chmod(cpath, 0o600)
     except Exception: pass
 
@@ -565,7 +639,7 @@ _CC = _creds()          # per-model overrides; anything not set falls back to kn
 def match_model(table, model=None):
     """Value from `table` for this car. `model` is passed explicitly by demo mode, which has its
     own car rather than the one in creds.json."""
-    return known_cars.match(table, model if model is not None else VEHICLE.get("model"))
+    return known_cars.match(table, model if model is not None else _vehicle()["model"])
 
 KNOWN = match_model(known_cars.CARS) or {}
 
@@ -589,11 +663,6 @@ TPMS_SCALE = float(_CC.get("tpms_scale") or KNOWN.get("tpms_scale") or 1.373)
 # --- pack chemistry: decides the 100%-charge advice (LFP wants one regularly, NMC does not) ---
 CHEMISTRY = (_CC.get("chemistry") or KNOWN.get("chemistry") or "lfp").lower()   # lfp | nmc — J5 is LFP
 CHEMISTRY_KNOWN = bool(_CC.get("chemistry") or KNOWN.get("chemistry"))
-# Optional path/URL to a picture of YOUR car for the dashboard hero. The bundled render is a
-# Jaecoo J5; showing it to an Omoda/Chery/Tiggo owner is just wrong, so anything we don't have
-# a render for falls back to a neutral silhouette (see web/car-generic.svg) instead.
-#   your own picture  >  CarLinko's render of your actual car  >  (client picks J5 or silhouette)
-CAR_IMAGE = (_CC.get("car_image") or "").strip() or ("/car-photo" if VEHICLE_IMG else None)
 
 # Brochure specs. These are per-model facts nothing in the telemetry can tell us, so they can only
 # come from a table or from you. Showing the J5's numbers to a Tiggo owner is stating a falsehood,
@@ -1089,6 +1158,91 @@ def demo_summary():
     lf["saved"] = max(0, round(lf["km"] * (PETROL_RP_L / PETROL_KM_L - out["insights"].get("rp_per_km", 0))))
     return out
 
+# The pieces of summary() that Voltmoss alerts read and that depend on more than the newest
+# frame. Shared with alert_summary() so the push dispatcher and /api/summary cannot disagree
+# about whether the car is moving, charging, on a bad tyre or a weak 12V battery.
+
+def _moving(data, now):
+    """Reliable "moving now": latest odometer rose vs the prior fresh frame (speed byte is garbage)."""
+    if len(data) >= 2:
+        (tsa, _, da), (tsb, _, db) = data[-2], data[-1]
+        oa, ob = da.get("odometer"), db.get("odometer")
+        if oa is not None and ob is not None and (now - tsb) < 120 and (tsb - tsa) < 120:
+            return ob > oa
+    return False
+
+def _last_tyre_frame(data):
+    """Newest (ts, dt, tyre bytes) carrying a real (non-FF) reading -- "last known good".
+    Sensors sleep when parked -> FF; keep showing the last live values + an as-of stamp."""
+    for ts2, dt2, dec2 in reversed(data):
+        tb = dec2.get("tyre")
+        if tb and any(x != 0xFF for x in tb):
+            return ts2, dt2, tb
+    return None
+
+def _tyre_fields(frame, latest_ts, now):
+    if frame is None:
+        return {}
+    ts2, dt2, tb = frame
+    # "psi" holds the value in the configured display unit; status logic below normalises to PSI
+    out = {"tpms": [{"pos": TPMS_POS[i], "psi": pressure(tb[i]), "temp": temp(tb[4 + i]),
+                     "valid": tb[i] != 0xFF} for i in range(4)],
+           "tpms_updated": dt2,
+           "tpms_age_min": round((now - ts2) / 60, 1),
+           "tpms_live": (ts2 == latest_ts),  # newest frame still has live tyres
+           # the undecoded bytes, so you can calibrate tpms_scale on a car that has real (direct)
+           # TPMS: read one wheel off the car's own screen, then tpms_scale = your_kPa / raw_byte.
+           "tpms_raw": [tb[i] for i in range(4)]}
+    raw_psi = [p for p in (_psi_raw(tb[i]) for i in range(4)) if p is not None]
+    if raw_psi:  # real per-wheel pressure present (J5: indirect TPMS, bytes stay FF; some cars send it)
+        out["tyre_indirect"] = False
+        out["tyre_status"] = "Check tyres" if any(p < 28 or p > 40 for p in raw_psi) else "Normal"
+    return out
+
+def _volt12_watch(data, now):
+    """12V battery watch (directly measured): 7-day min + status (readings are DC-DC-supported while awake)."""
+    v7 = [d2.get("volt12") for ts2, dt2, d2 in data if d2.get("volt12") and now - ts2 <= 7 * 86400]
+    if not v7:
+        return {}
+    mn = min(v7)
+    return {"volt12_min7d": round(mn, 2),
+            "volt12_status": "critical" if mn < 12.0 else ("low" if mn < 12.5 else "ok")}
+
+def _car_charging(dec):
+    """The car's own charging flags (b56/b57/b62-63), which beat the SoC-derived session detector:
+    the car flips to "active" the moment the charger starts, before any SoC tick (issue #5)."""
+    return dec.get("charge_state") == 1 and dec.get("charge_power") is not None
+
+# alert_summary() needs this much history before the frame it judges: the 12V watch reads
+# seven days, and no charge session that is still ongoing started earlier than that.
+ALERT_WINDOW = 7 * 86400
+
+def alert_summary(data, now, tyre_frame=None):
+    """The alert-relevant subset of summary(), as of the newest frame in `data`.
+
+    data = [(ts, dt, decoded)] for online frames, oldest first, covering ALERT_WINDOW before
+    the newest. tyre_frame is the last-known-good tyre reading from before the window, used only
+    when the window holds none. Bounded so the push dispatcher can judge each new frame without
+    re-decoding the whole history, which summary() does and which grows without limit."""
+    if not data:
+        return None
+    ts, dt, dec = data[-1]
+    fr = [(t, d.get("battery"), d.get("odometer")) for t, _, d in data
+          if d.get("battery") is not None and d.get("odometer") is not None]
+    out = {"vehicle": _vehicle(), "updated": dt, "battery": dec.get("battery"),
+           "odometer": dec.get("odometer"), "volt12": dec.get("volt12"),
+           "unlocked": dec.get("unlocked"), "doors": dec.get("doors"),
+           "trunk_open": dec.get("trunk_open"), "windows": dec.get("windows"),
+           "sunroof_open": dec.get("sunroof_open"), "moving": _moving(data, now),
+           "charging": {"active": _car_charging(dec) or
+                        any(s["ongoing"] for s in build_sessions(fr, now))},
+           "tyre_unit": TYRE_UNIT, "tyre_status": "Normal", "tyre_indirect": True,
+           "tpms": [{"pos": p, "psi": None, "temp": None, "valid": False} for p in TPMS_POS],
+           "volt12_status": None}
+    out.update(_tyre_fields(_last_tyre_frame(data) or tyre_frame, ts, now))
+    out.update(_volt12_watch(data, now))
+    return out
+
 def summary():
     """Public /api/summary payload.
 
@@ -1104,7 +1258,7 @@ def summary():
 def _summary():
     if DEMO:
         return demo_summary()
-    out = {"vehicle": VEHICLE, "online": False, "battery": None, "range_km": None,
+    out = {"vehicle": _vehicle(), "online": False, "battery": None, "range_km": None,
            "odometer": None, "volt12": None, "unlocked": None, "speed": None,
            "moving": False, "avg_speed": None, "insights": {}, "health": {}, "drain": None,
            "volt12_min7d": None, "volt12_status": None,
@@ -1113,7 +1267,7 @@ def _summary():
            "wltp_kwh_100": WLTP_KWH_100 if WLTP_KNOWN else None,
            "chemistry_known": CHEMISTRY_KNOWN, "powertrain": "bev", "fuel": None,
            "currency": {"symbol": CUR_SYMBOL, "locale": CUR_LOCALE, "code": CUR_CODE},
-           "tyre_unit": TYRE_UNIT, "tariff": TARIFF_IDR, "car_image": CAR_IMAGE,
+           "tyre_unit": TYRE_UNIT, "tariff": TARIFF_IDR, "car_image": _car_image(),
            "specs": model_specs(),
            "energy": {"today_kwh": 0.0, "consumption": None, "rating": None,
                       "week_consumption": None},
@@ -1130,8 +1284,11 @@ def _summary():
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
+    finally:
+        conn.close()
     # decode authoritatively from the stored raw blob (offset fixes apply to all history)
     data = []
     for ts, dt, online, raw in rows:
@@ -1164,31 +1321,9 @@ def _summary():
                        # EV + fuel on every capture (742 = 90 + 652, 687 = 38 + 649), so we compute
                        # it and the UI labels it as computed rather than read from the car.
                        "total_range_km": (ev + fr) if (ev is not None and fr is not None) else None}
-    # reliable "moving now": latest odometer rose vs the prior fresh frame (speed byte is garbage)
-    if len(data) >= 2:
-        (tsa, _, da), (tsb, _, db) = data[-2], data[-1]
-        oa, ob = da.get("odometer"), db.get("odometer")
-        if oa is not None and ob is not None and (time.time() - tsb) < 120 and (tsb - tsa) < 120:
-            out["moving"] = ob > oa
-    # tyres: hold the last frame that carried a real (non-FF) reading ("last known good").
-    # Sensors sleep when parked -> FF; keep showing the last live values + an as-of stamp.
-    for ts2, dt2, dec2 in reversed(data):
-        tb = dec2.get("tyre")
-        if tb and any(x != 0xFF for x in tb):
-            # "psi" holds the value in the configured display unit; status logic below normalises to PSI
-            out["tpms"] = [{"pos": TPMS_POS[i], "psi": pressure(tb[i]), "temp": temp(tb[4 + i]),
-                            "valid": tb[i] != 0xFF} for i in range(4)]
-            out["tpms_updated"] = dt2
-            out["tpms_age_min"] = round((time.time() - ts2) / 60, 1)
-            out["tpms_live"] = (ts2 == ts)  # newest frame still has live tyres
-            # the undecoded bytes, so you can calibrate tpms_scale on a car that has real (direct)
-            # TPMS: read one wheel off the car's own screen, then tpms_scale = your_kPa / raw_byte.
-            out["tpms_raw"] = [tb[i] for i in range(4)]
-            raw_psi = [p for p in (_psi_raw(tb[i]) for i in range(4)) if p is not None]
-            if raw_psi:  # real per-wheel pressure present (J5: indirect TPMS, bytes stay FF; some cars send it)
-                out["tyre_indirect"] = False
-                out["tyre_status"] = "Check tyres" if any(p < 28 or p > 40 for p in raw_psi) else "Normal"
-            break
+    now = time.time()
+    out["moving"] = _moving(data, now)
+    out.update(_tyre_fields(_last_tyre_frame(data), ts, now))
 
     # Daily distance comes from trips, each bucketed by the day it STARTED: a drive that crosses
     # midnight (23:45 -> 00:30) stays one trip on the day it began, so "today" only ever shows
@@ -1244,7 +1379,7 @@ def _summary():
     out["charging"]["mode"] = {16: "dc", 1: "ac"}.get(cmode)
     out["charging"]["state"] = cstate
     out["charging"]["remaining_min"] = dec.get("charge_remain")
-    if cstate == 1 and dec.get("charge_power") is not None:
+    if _car_charging(dec):
         out["charging"]["active"] = True
         out["charging"]["rate_kw"] = dec["charge_power"]
         out["charging"]["rate_source"] = "car"
@@ -1258,12 +1393,7 @@ def _summary():
     out["lifetime"] = res.get("lifetime", {})
     out["battery_care"] = res.get("battery_care", {})
     out["drain"] = parked_drain(data)                  # SoC lost across offline/parked gaps
-    # 12V battery watch (directly measured): 7-day min + status (readings are DC-DC-supported while awake)
-    v7 = [d2.get("volt12") for ts2, dt2, d2 in data if d2.get("volt12") and time.time() - ts2 <= 7 * 86400]
-    if v7:
-        mn = min(v7)
-        out["volt12_min7d"] = round(mn, 2)
-        out["volt12_status"] = "critical" if mn < 12.0 else ("low" if mn < 12.5 else "ok")
+    out.update(_volt12_watch(data, now))
     out["insights"] = insights(out)
     lf = out.get("lifetime") or {}                     # saved-vs-petrol over distance actually driven
     rpkm_l = out["insights"].get("rp_per_km")
@@ -1295,9 +1425,12 @@ def month_history(month):
     if not os.path.exists(DB):
         return empty
     conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT ts,dt,online,raw FROM telemetry WHERE ts >= ? AND ts < ? ORDER BY ts",
-        (t0, t1)).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT ts,dt,online,raw FROM telemetry WHERE ts >= ? AND ts < ? ORDER BY ts",
+            (t0, t1)).fetchall()
+    finally:
+        conn.close()
     data = []
     for ts, dt, online, raw in rows:
         if online != 1 or not raw:
@@ -1761,9 +1894,28 @@ def trip_plan(frm, to, soc, cons, reserve=10.0, target=80.0, derate=1.0, a=None,
             "src": "google" if _gkey() else "osm"}
 
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # quiet
+    def log_message(self, format, *args):
+        # _send records the outcome; avoid BaseHTTPRequestHandler's duplicate line.
         pass
+    def send_error(self, code, message=None, explain=None):
+        # Parser-level failures bypass _send; the raw request line can contain secrets.
+        LOG.log(logging.ERROR if code >= 500 else logging.WARNING,
+                "HTTP request rejected -> %d", code)
+        super().send_error(code, message, explain)
     def _send(self, code, body, ctype, extra=None):
+        path = self.path.split("?", 1)[0]
+        logged_path = ("/api/push/installations/{id}"
+                       if path.startswith("/api/push/installations/") else path)
+        failed = False
+        if path.startswith("/api/") and "json" in ctype:
+            try:
+                payload = json.loads(body)
+                failed = isinstance(payload, dict) and (payload.get("ok") is False or "error" in payload)
+            except (TypeError, ValueError):
+                pass
+        level = logging.ERROR if code >= 500 else logging.WARNING if code >= 400 or failed else logging.INFO
+        LOG.log(level, "%s %r -> %d%s", self.command, logged_path, code,
+                " (application failure)" if failed and code < 400 else "")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -1786,7 +1938,10 @@ class H(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/status":
             self._send(200, json.dumps({"configured": is_configured(), "gated": _gated(),
-                                        "authed": self._authed()}).encode(), "application/json")
+                                        "authed": self._authed(),
+                                        "api_version": API_VERSION,
+                                        "capabilities": status_capabilities()}).encode(),
+                       "application/json")
             return
         if _gated() and not self._authed() and path not in self._PUBLIC:
             if path in ("/", "/index.html", "/v2.html"):  # gated + locked -> show the unlock page
@@ -1794,6 +1949,15 @@ class H(BaseHTTPRequestHandler):
                     self._send(200, f.read(), "text/html; charset=utf-8")
                 return
             self._send(401, b'{"error":"locked"}', "application/json")
+            return
+        if path == "/api/push/status":
+            if not push_configured():
+                self._send(200, b'{"enabled":false,"registered_count":0}', "application/json")
+                return
+            import push_registrations as push
+            self._send(200, json.dumps({"enabled": push_enabled(),
+                                        "registered_count": push.count(PUSH_DB)}).encode(),
+                       "application/json")
             return
         if path == "/api/summary":
             self._send(200, json.dumps(summary()).encode(), "application/json")
@@ -1825,7 +1989,8 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(result).encode(), "application/json")
             except (ValueError, TypeError):
                 self._send(400, b'{"error":"invalid coordinates"}', "application/json")
-            except Exception:
+            except Exception as e:
+                _log_exception("GET /api/service-centres failed", e)
                 self._send(502, b'{"error":"service centre search unavailable"}', "application/json")
             return
         if path == "/api/controls":                    # what this car supports + opcodes to test
@@ -1835,6 +2000,7 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"caps": control_caps(), "known": KNOWN_OPCODES}).encode(),
                            "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"error": str(e)[:180]}).encode(), "application/json")
             return
         if path == "/car-photo":     # cached proxy for CarLinko's own render of this exact car.
@@ -1853,6 +2019,7 @@ class H(BaseHTTPRequestHandler):
                 kind = "image/png" if blob[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
                 self._send(200, blob, kind)
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(502, ("car image fetch failed: %r" % (e,)).encode(), "text/plain")
             return
         if path == "/api/refresh":                     # manual button: poll the car live, then return
@@ -1864,7 +2031,8 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             try:
                 res = _suggest((q.get("q") or [""])[0])
-            except Exception:
+            except Exception as e:
+                _log_exception("GET /api/geocode failed", e)
                 res = []
             self._send(200, json.dumps(res).encode(), "application/json")
             return
@@ -1887,6 +2055,7 @@ class H(BaseHTTPRequestHandler):
                     res.sort(key=lambda x: x["dist"])
                     _trip_cache[key] = (time.time(), res)
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 res = {"error": repr(e)[:160]}
             self._send(200, json.dumps(res).encode(), "application/json")
             return
@@ -1909,6 +2078,7 @@ class H(BaseHTTPRequestHandler):
                 plan = trip_plan(g1("from", ""), g1("to", ""), soc, cons,
                                  float(g1("reserve", "15")), 80.0, float(g1("derate", "1.0")), a, b)
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 plan = {"error": repr(e)[:200]}
             if "error" not in plan:
                 _trip_cache["trip:" + qs] = (time.time(), plan)
@@ -1921,6 +2091,7 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(month_history((q.get("month") or [""])[0])).encode(),
                            "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}).encode(),
                            "application/json")
             return
@@ -1948,6 +2119,7 @@ class H(BaseHTTPRequestHandler):
                 elif path == "/api/geofences":      res = clx.geofences(*pg())
                 elif path == "/api/settings":       res = clx.device_settings()
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 res = {"ok": False, "error": str(e)[:180]}
             self._send(200, json.dumps(res).encode(), "application/json")
             return
@@ -1972,6 +2144,54 @@ class H(BaseHTTPRequestHandler):
         with open(fp, "rb") as f:
             self._send(200, f.read(), ctype + ("; charset=utf-8" if ctype.startswith("text") or "manifest" in ctype or ctype.endswith("svg+xml") else ""))
 
+    def do_PUT(self):
+        path = self.path.split("?", 1)[0]
+        prefix = "/api/push/installations/"
+        if not path.startswith(prefix) or "/" in path[len(prefix):]:
+            self._send(404, b'{"error":"not found"}', "application/json"); return
+        if not push_enabled():
+            self._send(404, b'{"error":"push unavailable"}', "application/json"); return
+        if not valid_session(_cookie_sid(self.headers.get("Cookie"))):
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 4096:
+                raise ValueError("invalid body size")
+            import push_registrations as push
+            binding = push.validate(path[len(prefix):], json.loads(self.rfile.read(n)))
+            push.put(PUSH_DB, binding)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            self._send(400, json.dumps({"error": str(e)[:120]}).encode(), "application/json")
+            return
+        except Exception as e:
+            _log_exception("push registration failed", e)
+            self._send(500, b'{"error":"registration failed"}', "application/json")
+            return
+        self._send(200, json.dumps({"ok": True,
+                                    "installation_id": binding["installation_id"]}).encode(),
+                   "application/json")
+
+    def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        prefix = "/api/push/installations/"
+        if not path.startswith(prefix) or "/" in path[len(prefix):]:
+            self._send(404, b'{"error":"not found"}', "application/json"); return
+        # Revocation stays available if the worker has stopped after signup.
+        if not push_configured():
+            self._send(404, b'{"error":"push unavailable"}', "application/json"); return
+        if not valid_session(_cookie_sid(self.headers.get("Cookie"))):
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        import push_registrations as push
+        installation_id = path[len(prefix):]
+        if not push.valid_id(installation_id):
+            self._send(400, b'{"error":"invalid installation ID"}', "application/json"); return
+        try:
+            push.delete(PUSH_DB, installation_id)
+        except Exception as e:
+            _log_exception("push deletion failed", e)
+            self._send(500, b'{"error":"deletion failed"}', "application/json"); return
+        self._send(200, b'{"ok":true}', "application/json")
+
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/api/login":
@@ -1988,6 +2208,7 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"ok": True, "vehicle": veh}).encode(),
                            "application/json", self._set_cookie())   # log them straight in
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 msg = str(e)
                 if "login failed" in msg.lower() or "code" in msg.lower():
                     m = re.search(r"'code': '(\d+)'", msg)
@@ -2009,6 +2230,7 @@ class H(BaseHTTPRequestHandler):
                 else:
                     self._send(200, json.dumps({"ok": False, "error": "Wrong password."}).encode(), "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:120]}).encode(), "application/json")
             return
         if path == "/api/forcerefresh":                # poke the car with the benign init (0x77) so it
@@ -2021,6 +2243,7 @@ class H(BaseHTTPRequestHandler):
                                             "code": d.get("code"), "msg": d.get("msg")}).encode(),
                            "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}).encode(), "application/json")
             return
         if path == "/api/control":                     # fire a remote-control opcode at the car
@@ -2042,6 +2265,7 @@ class H(BaseHTTPRequestHandler):
                 d = send_control(op, body.get("timeOut") or 20)
                 self._send(200, json.dumps(control_result(op, d)).encode(), "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:180]}).encode(), "application/json")
             return
         if path in ("/api/actemp", "/api/seat"):       # climate opcodes -- the server encodes + checks them
@@ -2058,6 +2282,7 @@ class H(BaseHTTPRequestHandler):
                 res = ({"ok": False, "error": err} if err else
                        {**control_result(op, send_control(op, body.get("timeOut") or 20)), "opcode": op})
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 res = {"ok": False, "error": str(e)[:180]}
             self._send(200, json.dumps(res).encode(), "application/json")
             return
@@ -2089,6 +2314,7 @@ class H(BaseHTTPRequestHandler):
                     bool(body.get("enabled")), int(body.get("hour", 0)),
                     int(body.get("minute", 0)), body.get("week"), confirm)
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 res = {"ok": False, "error": str(e)[:180]}
             self._send(200, json.dumps(res).encode(), "application/json")
             return
@@ -2115,6 +2341,7 @@ class H(BaseHTTPRequestHandler):
                 except Exception: pass
                 self._send(200, json.dumps({"ok": True}).encode(), "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}).encode(),
                            "application/json")
             return
@@ -2142,6 +2369,7 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"ok": True, "car_image": "/car-photo",
                                             "bytes": len(blob)}).encode(), "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}).encode(),
                            "application/json")
             return
@@ -2190,6 +2418,7 @@ class H(BaseHTTPRequestHandler):
                                             "car_image": c.get("car_image", "")}).encode(),
                            "application/json")
             except Exception as e:
+                _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:120]}).encode(),
                            "application/json")
             return
@@ -2199,10 +2428,10 @@ def main():
     ports = [a for a in sys.argv[1:] if a.isdigit()]       # ignore flags like --demo
     port = int(ports[0]) if ports else 8088
     if DEMO:
-        print(f"CarLinko dashboard (DEMO — fake data) on http://0.0.0.0:{port}")
+        LOG.info("dashboard starting in demo mode on port %d", port)
     else:
         _ensure_db()                                       # so a brand-new install serves without crashing
-        print(f"CarLinko dashboard on http://0.0.0.0:{port}  (db={os.path.abspath(DB)})")
+        LOG.info("dashboard starting on port %d (db=%s)", port, os.path.abspath(DB))
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 
 if __name__ == "__main__":
