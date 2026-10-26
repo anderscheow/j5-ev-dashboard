@@ -259,6 +259,11 @@ strings, cookies, request bodies, passwords and tokens are omitted. Set `CARLINK
 to show only warnings and errors (the default is `INFO`). The telemetry logger runs separately
 and writes its poll output to its own service log.
 
+On Railway the same lines are written to stdout as one JSON object each (`level`, `message`,
+`logger`), because Railway marks every stderr line as an error regardless of what it says. This
+switches on by itself when `RAILWAY_ENVIRONMENT_NAME` is set; `CARLINKO_LOG_FORMAT=json` or
+`=text` forces either format anywhere.
+
 | Deployment | View live logs |
 | --- | --- |
 | Docker Compose | `docker compose logs -f web logger` |

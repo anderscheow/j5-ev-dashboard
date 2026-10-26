@@ -7,12 +7,10 @@ import logging, traceback
 import hmac, hashlib, base64, secrets, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import known_cars          # per-model constants the telemetry never carries (pack size, tyre scale)
+import log_setup
 import maintenance
 
-logging.basicConfig(
-    level=os.environ.get("CARLINKO_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+log_setup.configure()
 LOG = logging.getLogger("carlinko.server")
 
 def _log_exception(context, exc, level=logging.ERROR):
