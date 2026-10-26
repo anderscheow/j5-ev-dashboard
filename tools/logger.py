@@ -10,9 +10,9 @@ Usage:
 import sys, json, time, sqlite3, argparse, os, socket, logging, traceback
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import websocket  # websocket-client
+import log_setup
 
-logging.basicConfig(level=os.environ.get("CARLINKO_LOG_LEVEL", "INFO").upper(),
-                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log_setup.configure()
 LOG = logging.getLogger("carlinko.telemetry")
 
 def _failure(context, exc):
