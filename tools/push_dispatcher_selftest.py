@@ -119,6 +119,20 @@ class AlertParityTest(unittest.TestCase):
         events, _ = evaluator.evaluate(rules, {}, indirect, SERVICE)
         self.assertEqual(events, [])
 
+    def test_panel_open_says_what_is_open(self):
+        rules = {"panel_open": {"on": True}}
+        # Two doors and the sunroof; byte 2's undecoded high bits are no door.
+        events, _ = evaluator.evaluate(
+            rules, {}, snapshot(doors=1 | 4 | 64, sunroof_open=True), SERVICE)
+        self.assertEqual(events, [{"kind": "panel_open", "value": 1 | 4 | 32}])
+        events, _ = evaluator.evaluate(
+            rules, {}, snapshot(trunk_open=True, windows_open=True), SERVICE)
+        self.assertEqual(events, [{"kind": "panel_open", "value": 16 | 64}])
+        # A silent field is not "closed", and not "open" either.
+        events, _ = evaluator.evaluate(
+            rules, {}, snapshot(doors=None, trunk_open=None), SERVICE)
+        self.assertEqual(events, [])
+
     def test_low_12v_status_without_a_reading_has_no_value(self):
         rules = {"volt12_low": {"on": True}}
         for volts in (0, None, 0.0):
