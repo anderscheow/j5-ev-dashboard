@@ -10,3 +10,5 @@
 - `/api/controls` keeps `seatHeat` / `seatVent` beside the new `seats`, for clients that read them.
 - Voltmoss can open the maintenance guide from the Vehicle tab. Older clients
   can ignore the new capability IDs and routes.
+- Maintenance lookup recognizes Chery Super Hybrid (CSH) as PHEV and selects
+  the specific Tiggo 7 or Tiggo 8 PHEV schedule.

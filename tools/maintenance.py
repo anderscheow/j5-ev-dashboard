@@ -5,6 +5,7 @@ another market's interval or invent a price for an unsupported model.
 """
 
 import json
+import re
 from pathlib import Path
 
 SOURCE = "https://omodajaecoo.com.my/themes/demo/assets/pdf/J5EV-Maintenance-Schedule.pdf"
@@ -254,6 +255,7 @@ for _name in CATALOGUE:
 
 def _match_model(model):
     name = model.lower().replace("-", " ").strip()
+    name = re.sub(r"\bcsh\b", "phev", name)
     if "icar" in name or "icaur" in name:
         variant = "iWD" if "iwd" in name else "RWD" if "rwd" in name else None
         series = "V23" if "v23" in name else "03" if "03" in name else None
@@ -277,9 +279,10 @@ def _match_model(model):
         if "1.5" in name or "petrol" in name:
             return "Chery Tiggo Cross 1.5T"
         return None
-    for key in CATALOGUE:
-        if key.startswith("Chery ") and key[6:].lower() in name:
-            return key
+    chery_matches = [key for key in CATALOGUE
+                     if key.startswith("Chery ") and key[6:].lower() in name]
+    if chery_matches:
+        return max(chery_matches, key=len)
     candidates = [key for key in CATALOGUE if key.lower() in name]
     return max(candidates, key=len) if candidates else None
 

@@ -50,6 +50,17 @@ class MaintenanceTest(unittest.TestCase):
         self.assertFalse(maintenance.timetable("ID", "Jaecoo J5 EV", 0)["supported"])
         self.assertEqual(maintenance.brand_for("iCAUR 03"), "iCAUR")
 
+    def test_csh_uses_phev_schedule(self):
+        for series in (7, 8):
+            expected = f"Chery Tiggo {series} PHEV"
+            for model in (f"TIGGO {series} CSH", f"Chery Tiggo {series} CSH 2026",
+                          f"Chery Tiggo {series} PHEV"):
+                with self.subTest(model=model):
+                    guide = maintenance.timetable("MY", model, 0)
+                    self.assertTrue(guide["supported"])
+                    self.assertEqual(guide["selected_model"], expected)
+                    self.assertEqual(guide["source"], maintenance.CATALOGUE[expected][0])
+
     def test_nearest_centres_follow_brand_directory(self):
         for model in ("Jaecoo J5 EV", "Chery Omoda E5", "iCAUR 03"):
             with self.subTest(model=model):
