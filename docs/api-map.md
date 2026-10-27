@@ -142,7 +142,7 @@ careless field rename becomes somebody else's outage rather than just ours.
 ```json
 {
   "api_version": 1,
-  "capabilities": ["settings_read", "target_soc", "charge_schedule", "scheduled_travel", "vehicle_alerts", "climate_settings", "climate_seats", "maintenance_guide", "service_centres"]
+  "capabilities": ["settings_read", "target_soc", "charge_schedule", "scheduled_travel", "vehicle_alerts", "climate_settings", "climate_seats", "maintenance_guide", "service_centres", "maintenance_records"]
 }
 ```
 
@@ -154,7 +154,8 @@ Capability IDs are stable, lowercase strings. A claim means the **server impleme
 and its documented read/write behavior. It does not mean this owner's car exposes the control,
 that their CarLinko account has permission, or that a vendor request will succeed. Clients must
 still inspect vehicle control caps and operation results. Demo mode reports only
-`maintenance_guide` and `service_centres`, which its fixture implements; its
+`maintenance_guide`, `service_centres` and `maintenance_records`, which it
+implements (the log in a scratch directory that goes with the process); its
 account settings remain unavailable.
 
 | ID | Server behavior |
@@ -169,6 +170,27 @@ account settings remain unavailable.
 | `climate_seats` | `POST /api/seat` applies a supported seat heat/vent level after checking the car's capabilities. |
 | `maintenance_guide` | `GET /api/maintenance-guide` returns the country and model timetable, completed milestones, and next due service. |
 | `service_centres` | `GET /api/service-centres` returns nearby brand service centres and an official locator link for the supplied coordinates. |
+| `maintenance_records` | The owner's maintenance log, kept by the dashboard rather than any one client — see *Maintenance log* below. |
+
+### Maintenance log — `maintenance_records`
+
+What the owner recorded against the maintenance timetable lives on the dashboard, in
+`maintenance.db` beside the telemetry database, so every client sees the same log. Every
+route needs a session when the dashboard is gated. A milestone is **done when it has a
+record**; there is no separate tick.
+
+| Route | Behavior |
+|---|---|
+| `GET /api/maintenance/records` | `{country, model, records: [...]}`. `country` (`MY`/`ID`) and `model` (the catalogue model chosen for a car whose own name matched none) are the guide preferences, null when never set. Each record carries its `model` and `km`. |
+| `PUT /api/maintenance/records/{km}?model=` | Stores one record (JSON, ≤ 64 KB) and answers it as stored. `at` (ISO date-time) is required; `odo`, `items` (`name`, `qty`, `price` — the unit price), `discount`, `tax`, `total` (the receipt's own bottom line, tax included), `currency` (ISO code), `receipts` (IDs, ≤ 20) and `notes` are optional. Every receipt named must already be uploaded; one the previous version named and this one does not is deleted. |
+| `DELETE /api/maintenance/records/{km}?model=` | The milestone is no longer done; its receipts are deleted with it. |
+| `PUT /api/maintenance/preferences` | `{country?, model?}`; a null `model` clears the choice. |
+| `POST /api/maintenance/receipts` | One image as the raw body (JPEG, PNG, WebP or HEIC by magic bytes, ≤ 10 MB) → `{id, bytes}`. An upload no record claims within a day is collected. |
+| `GET /api/maintenance/receipts/{id}` | The image, with its sniffed content type. IDs are unguessable and never written to the request log. |
+
+Bad input is a 400 with `{error}` before anything is written. `GET /api/maintenance-guide`
+still takes its `completed` list from the client, which sends the milestones that have
+records; the timetable route is unchanged.
 
 For older servers, either field can be absent. Clients should treat an absent or malformed
 capability list as **unknown**, not proof that the server is obsolete. A missing `api_version`
