@@ -71,6 +71,22 @@ def _volt12_low(snapshot):
     return 0 < voltage < 11.9
 
 
+# What panel_open found open, as one number -- the event's value, which the push relay renders as
+# "Still open: 2 doors, sunroof". Mirrors OpenPanels in Voltmoss's lib/core/utils/alert_evaluator.dart:
+# the low four bits are the car's own door bits as reported (counted, never named -- which corner each
+# is was tested on an Omoda E5 only), then the tailgate, the sunroof and a window.
+PANEL_DOORS, PANEL_TAILGATE, PANEL_SUNROOF, PANEL_WINDOW = 15, 16, 32, 64
+
+
+def _open_panels(snapshot):
+    # Null is not "closed": only a field that actually says true counts.
+    doors = snapshot.get("doors")
+    return ((doors & PANEL_DOORS if isinstance(doors, int) else 0) |
+            (PANEL_TAILGATE if snapshot.get("trunk_open") is True else 0) |
+            (PANEL_SUNROOF if snapshot.get("sunroof_open") is True else 0) |
+            (PANEL_WINDOW if snapshot.get("windows_open") is True else 0))
+
+
 def evaluate(rules, memory, snapshot, service, today=None):
     """Return (events, next memory); events are {kind, value} dictionaries."""
     today = today or date.today()
@@ -99,12 +115,8 @@ def evaluate(rules, memory, snapshot, service, today=None):
     level("soc_below", not charging and battery < _threshold(rules, "soc_below"), battery)
     parked = not snapshot.get("moving", False)
     level("left_unlocked", parked and snapshot.get("unlocked") is True)
-    doors = snapshot.get("doors")
-    panel = ((doors is not None and doors & 15 != 0) or
-             snapshot.get("trunk_open") is True or
-             snapshot.get("sunroof_open") is True or
-             snapshot.get("windows_open") is True)
-    level("panel_open", parked and panel)
+    panels = _open_panels(snapshot)
+    level("panel_open", parked and panels != 0, panels)
     level("tyre_pressure", _tyre_problem(snapshot))
     # A low status can arrive without a usable reading (0 V is the decoder's "absent"). The
     # event still goes out, with no number, and the relay picks the copy that quotes none.
