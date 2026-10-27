@@ -19,7 +19,8 @@ price date is returned as `price_date`. Chery's machine-readable transcription
 is stored in `tools/maintenance_chery_my.json`. Other schedules are encoded in
 `tools/maintenance.py`. New models must have an official Malaysian source
 before being added. Ambiguous drive variants require explicit selection in
-the app.
+the app. The matcher treats the Chery Super Hybrid (CSH) badge as PHEV, so
+Tiggo 7 CSH and Tiggo 8 CSH use their respective published PHEV schedules.
 
 `GET /api/service-centres` ranks the manufacturer's published service
 directory by distance from the user's coordinates. The captured directory
