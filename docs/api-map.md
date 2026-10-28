@@ -166,6 +166,7 @@ account settings remain unavailable.
 | `scheduled_travel` | `POST /api/scheduledtravel` writes advance travel; current schedule reads back through `/api/settings`. |
 | `vehicle_alerts` | `GET /api/alertconfig` and `POST /api/alertconfig` read/write the two supported alert switches; `/api/settings` also exposes them. |
 | `push_alerts` | `GET /api/push/status`, `PUT /api/push/installations/{installation_id}`, and `DELETE /api/push/installations/{installation_id}` manage Voltmoss remote-alert bindings. Advertised only when the dashboard is configured, password-gated, and explicitly configured for a HTTPS relay and HTTPS public access. This is separate from CarLinko's `vehicle_alerts`. |
+| `push_charge_started` | The push binding accepts and the dispatcher evaluates the `charge_started` rule. Advertised exactly when `push_alerts` is: the kind arrived after the binding contract shipped, and a dashboard without it answers 400 to a binding that names it, so a phone names it only when this is listed. |
 | `climate_settings` | `POST /api/actemp` sets a supported A/C temperature and `POST /api/airduration` sets 5, 10 or 15 minutes; current duration reads back through `/api/controls`. |
 | `climate_seats` | `POST /api/seat` applies a supported seat heat/vent level after checking the car's capabilities. |
 | `maintenance_guide` | `GET /api/maintenance-guide` returns the country and model timetable, completed milestones, and next due service. |
@@ -209,7 +210,11 @@ when the worker is stopped. The dispatcher watches committed telemetry rows,
 persists per-phone alert memory and a retry outbox in `push_alerts.db`, and
 sends only event kind/value/ID/timestamp to the relay. It never sends a push
 from `GET /api/summary`. A frame older than two minutes is not announced.
-The relay rejects events more than fifteen minutes old.
+The relay rejects events more than fifteen minutes old. Every value is the
+evaluator's own except `charge_started`'s: the relay keeps no time zone, so the
+car's time-to-done goes out as the estimated finish in minutes past midnight on
+the phone's clock (the binding's `time_zone`), which the relay prints as
+`HH:MM`; null when the car gave no estimate.
 
 On Railway, `tools/railway_start.sh` starts one dispatcher beside the logger
 and web server when the flag is `1`; keep a persistent `/data` volume for
@@ -244,9 +249,10 @@ string. The body is at most 4096 bytes:
 
 `sender_secret` is the relay-issued, per-installation event credential. The
 dashboard stores it on its own data volume but never echoes or logs it. Rule
-keys are `charge_complete`, `charge_stopped`, `soc_below`, `left_unlocked`,
-`panel_open`, `tyre_pressure`, `volt12_low`, and `service_due`; only enabled
-rules appear. The only threshold presets are 80/90/100 for charge completion
+keys are `charge_started`, `charge_complete`, `charge_stopped`, `soc_below`,
+`left_unlocked`, `panel_open`, `tyre_pressure`, `volt12_low`, and
+`service_due`; only enabled rules appear, and `charge_started` only when
+`/api/status` lists `push_charge_started`. The only threshold presets are 80/90/100 for charge completion
 and 10/20/30 for low SoC. Supported locales are `en`, `ms`, `id`, `zh`.
 `plus` is client-reported, matching the current widget gate; it is not receipt
 verification. Writes require a valid password-gated `sid` session and return
@@ -364,6 +370,22 @@ The dashboard now surfaces `charging.mode` (`ac`/`dc`), `charging.state`, `charg
 (the car's own time-to-done — the field the Tiggo 7 owner asked about in #3) and prefers the car's
 own `charge_power_kw` for `charging.rate_kw` over the SoC-derived estimate. `wltc_range_km` is
 exposed at the API level.
+
+**The car's flag ends a charge it flagged (2026-10-28).** `charging.active` used to be "the car
+says charging *or* the SoC-rise detector has a session open", and the detector holds a session
+open for 30 minutes after its last rise — so a Tiggo 7 charge the car reported complete at 100 %
+(`b57=2`, 16:49:57) read as charging until ~17:20, unplugged at 16:58 and all. A session the car
+flagged (`b57=1`) at any point now ends the moment the flag drops, and `charging.session.ongoing`
+with it. A session it never flagged keeps the detector, because the flag is not always live: on
+2026-08-25 the same car charged 62 → 100 % with `b57` at 0 throughout. The meaning of the field is
+unchanged, so `api_version` is not.
+
+**`charging.elapsed_min` (additive).** Whole minutes since the car's flag turned on for the charge
+in progress, as of the newest frame; null when the car's flag is not on (including a charge only
+the SoC detector saw). It exists because `remaining_min`'s first reading is not a forecast: the car
+takes it before the charger has ramped up — 351 min at plug-in and 146 min a minute later for a
+152-minute charge (2026-10-28), and 306 walking down to ~230 over the first ten minutes of a 3.2 kW
+charge (2026-10-24). Voltmoss quotes a finish time only from five minutes in.
 
 ### Fuel range — RESOLVED ✅ (bytes 70–71)
 

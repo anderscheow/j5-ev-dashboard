@@ -63,9 +63,13 @@ def push_enabled():
     import push_dispatcher
     return push_dispatcher.healthy(PUSH_DB)
 
+# Push alert kinds added after push_alerts shipped, each advertised alongside it. A phone names
+# one in its binding only when this dashboard lists it, because an older one refuses the binding.
+PUSH_CAPABILITIES = ("push_alerts", "push_charge_started")
+
 def status_capabilities():
     return (["maintenance_guide", "service_centres", "maintenance_records"] if DEMO else
-            [*CAPABILITIES, *(["push_alerts"] if push_enabled() else [])])
+            [*CAPABILITIES, *(PUSH_CAPABILITIES if push_enabled() else ())])
 
 _poll_lock = threading.Lock()
 
@@ -1009,14 +1013,16 @@ def analyze(data, trips, kwh_day):
                   "overdue" if since >= BALANCE_DAYS * 2 else
                   "due" if since >= BALANCE_DAYS else "ok"),
         "balance_due": (not full) or (since >= BALANCE_DAYS)}   # kept for older clients
-    ongoing = [s for s in sess if s["ongoing"]]
-    if ongoing:
-        s = ongoing[-1]; lr = live_rate(s["pts"])
-        out["charging"].update(active=True, session_kwh=round(s["kwh"], 2), soc=s["soc1"],
-                               rate_kw=round(lr if lr is not None else s["avg"], 1))
-    detail = ongoing[-1] if ongoing else (sess[-1] if sess else None)
+    live = _live_soc_session(data, sess)
+    if live:
+        lr = live_rate(live["pts"])
+        out["charging"].update(active=True, session_kwh=round(live["kwh"], 2), soc=live["soc1"],
+                               rate_kw=round(lr if lr is not None else live["avg"], 1))
+    detail = live or (sess[-1] if sess else None)
     if detail:
         out["charging"]["session"] = session_detail(detail)
+        # Still inside the detector's idle window, but the car has said the charge is over.
+        out["charging"]["session"]["ongoing"] = detail is live
     trips_all = trips
     out["trips"] = trips_all[:8]
     out["outings"] = fold_outings(trips_all)[::-1][:8]   # newest first, what the UIs list
@@ -1219,6 +1225,47 @@ def _car_charging(dec):
     the car flips to "active" the moment the charger starts, before any SoC tick (issue #5)."""
     return dec.get("charge_state") == 1 and dec.get("charge_power") is not None
 
+def _live_soc_session(data, sessions):
+    """The SoC-rise session still in progress as of the newest frame in `data`, or None.
+
+    The detector holds a session open for IDLE_GAP after its last rise, which on its own kept a
+    charge the car reported complete at 16:49:57 (2026-10-28, 100 %, b57=2) reading as charging
+    until ~17:20 -- and every "charging ended" alert half an hour late with it. So a session the
+    car flagged as charging at any point ends when that flag drops: the flag is evidently live on
+    this car. A session the car never flagged keeps the detector, because the flag is not always
+    live: on 2026-08-25 this Tiggo 7 charged 62 -> 100 % with b57 at 0 throughout."""
+    ongoing = [s for s in sessions if s["ongoing"]]
+    if not ongoing:
+        return None
+    s = ongoing[-1]
+    if _car_charging(data[-1][2]):
+        return s
+    for ts, _dt, dec in reversed(data):
+        if ts < s["start"]:
+            break
+        if _car_charging(dec):
+            return None
+    return s
+
+# The car's minutes-to-done (b58-59) is taken before the charger has ramped up, so its first
+# reading is not a forecast: on 2026-10-28 it read 351 min at plug-in and 146 min a minute later,
+# for a charge that took 152; on 2026-10-24 a 3.2 kW charge walked down from 306 to ~230 over its
+# first ten minutes. Clients wait for charging.elapsed_min to reach a few minutes before quoting it.
+def _charge_elapsed_min(data):
+    """Whole minutes the car has reported this charge, as of the newest frame in `data`.
+
+    Back to the first frame of the current unbroken run of the car's own charging flag. None when
+    the newest frame is not charging by that flag, including a frame that carries no flag at all:
+    a SoC-detected session has no start a client could time an estimate against."""
+    if not data or not _car_charging(data[-1][2]):
+        return None
+    start = data[-1][0]
+    for ts, _dt, dec in reversed(data):
+        if not _car_charging(dec):
+            break
+        start = ts
+    return int((data[-1][0] - start) // 60)
+
 # alert_summary() needs this much history before the frame it judges: the 12V watch reads
 # seven days, and no charge session that is still ongoing started earlier than that.
 ALERT_WINDOW = 7 * 86400
@@ -1241,7 +1288,9 @@ def alert_summary(data, now, tyre_frame=None):
            "trunk_open": dec.get("trunk_open"), "windows": dec.get("windows"),
            "sunroof_open": dec.get("sunroof_open"), "moving": _moving(data, now),
            "charging": {"active": _car_charging(dec) or
-                        any(s["ongoing"] for s in build_sessions(fr, now))},
+                        _live_soc_session(data, build_sessions(fr, now)) is not None,
+                        "remaining_min": dec.get("charge_remain"),
+                        "elapsed_min": _charge_elapsed_min(data)},
            "tyre_unit": TYRE_UNIT, "tyre_status": "Normal", "tyre_indirect": True,
            "tpms": [{"pos": p, "psi": None, "temp": None, "valid": False} for p in TPMS_POS],
            "volt12_status": None}
@@ -1414,11 +1463,13 @@ def _summary():
     out["charging"] = res["charging"]
     # Prefer the car's own charging flags over the SoC-derived session detector: b56/b57/b62-63
     # report connector, state and instant power directly (verified on J5 DC + Tiggo 8 AC frames,
-    # issue #5). The car flips to "active" the moment the charger starts, before any SoC tick.
+    # issue #5). The car flips to "active" the moment the charger starts, before any SoC tick,
+    # and analyze() lets it end a session it flagged -- see _live_soc_session().
     cmode = dec.get("charge_mode"); cstate = dec.get("charge_state")
     out["charging"]["mode"] = {16: "dc", 1: "ac"}.get(cmode)
     out["charging"]["state"] = cstate
     out["charging"]["remaining_min"] = dec.get("charge_remain")
+    out["charging"]["elapsed_min"] = _charge_elapsed_min(data)
     if _car_charging(dec):
         out["charging"]["active"] = True
         out["charging"]["rate_kw"] = dec["charge_power"]
