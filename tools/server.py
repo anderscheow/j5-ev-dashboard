@@ -2,7 +2,7 @@
 Serves the mobile PWA in ./web and a JSON API computed from carlinko.db.
 Run: python server.py [port]   (default 8088, binds 0.0.0.0 so Tailscale can reach it)
 """
-import os, sys, json, time, sqlite3, threading, math, calendar, tempfile, urllib.request, urllib.parse
+import os, sys, json, time, sqlite3, threading, math, calendar, copy, tempfile, urllib.request, urllib.parse
 import logging, traceback
 import hmac, hashlib, base64, secrets, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1249,16 +1249,50 @@ def alert_summary(data, now, tyre_frame=None):
     out.update(_volt12_watch(data, now))
     return out
 
+# _summary() decodes every stored frame, so its cost grows with the database. Each caller used
+# to compute its own copy: an app polls every 5 s and kept polling while its last answer was
+# still pending, the maintenance guide asks for one too, and once a single answer took longer
+# than a poll the requests stacked up - 115 threads decoding the whole history at once, a
+# logger that could no longer commit, and a server that answered nothing. Callers now share one
+# computation: a request that arrives while one is running waits for it, and its result serves
+# everyone asking while its inputs are unchanged and the answer is younger than SUMMARY_TTL
+# (age_min and the other time-derived fields keep moving).
+SUMMARY_TTL = 3.0
+_summary_lock = threading.Lock()
+_summary_cache = None  # (inputs, time.monotonic() when computed, payload)
+
+def _summary_inputs():
+    """Every file _summary() reads: the database, which the logger and a live poll commit
+    frames to (and its log, should it ever run in WAL mode), and creds.json, which carries the
+    vehicle identity, the photo override and the re-sync setting."""
+    state = []
+    for path in (DB, DB + "-wal", os.path.join(_DATA, "creds.json")):
+        try:
+            st = os.stat(path)
+            state.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            state.append(None)
+    return tuple(state)
+
 def summary():
     """Public /api/summary payload.
 
     The version is stamped here rather than inside _summary(), which has four separate return
     paths (demo, two early-outs and the full build). Doing it in one wrapper means a new branch
     added later cannot ship a payload without it.
+
+    Computed once for concurrent callers (see SUMMARY_TTL); each caller gets its own copy.
     """
-    out = _summary()
-    out["api_version"] = API_VERSION
-    return out
+    global _summary_cache
+    with _summary_lock:
+        state = _summary_inputs()
+        cached = _summary_cache
+        if cached and cached[0] == state and time.monotonic() - cached[1] < SUMMARY_TTL:
+            return copy.deepcopy(cached[2])
+        out = _summary()
+        out["api_version"] = API_VERSION
+        _summary_cache = (state, time.monotonic(), out)
+        return copy.deepcopy(out)
 
 
 def _summary():
