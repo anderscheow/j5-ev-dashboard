@@ -100,6 +100,9 @@ class PushContractTest(unittest.TestCase):
         cookie = self.enable()
         _, status = self.request("GET", "/api/status")
         self.assertIn("push_alerts", status["capabilities"])
+        # Advertised with push_alerts and never without it: a phone names charge_started in its
+        # binding only when the dashboard lists the capability.
+        self.assertIn("push_charge_started", status["capabilities"])
         self.assertEqual(status["api_version"], server.API_VERSION)
         self.assertEqual(self.request("PUT", "/api/push/installations/" + INSTALLATION, BODY)[0], 401)
         self.assertEqual(self.request("PUT", "/api/push/installations/" + INSTALLATION, BODY, cookie)[0], 200)
@@ -109,7 +112,9 @@ class PushContractTest(unittest.TestCase):
         path = "/api/push/installations/" + INSTALLATION
         self.assertEqual(self.request("PUT", path, BODY, cookie)[0], 200)
         with patch.object(push_dispatcher, "healthy", return_value=False):
-            self.assertNotIn("push_alerts", self.request("GET", "/api/status")[1]["capabilities"])
+            capabilities = self.request("GET", "/api/status")[1]["capabilities"]
+            self.assertNotIn("push_alerts", capabilities)
+            self.assertNotIn("push_charge_started", capabilities)
             self.assertEqual(self.request("GET", "/api/push/status", cookie=cookie)[1],
                              {"enabled": False, "registered_count": 1})
             self.assertEqual(self.request("DELETE", path, cookie=cookie)[0], 200)
@@ -125,6 +130,9 @@ class PushContractTest(unittest.TestCase):
         self.assertEqual(self.request("GET", "/api/push/status", cookie=cookie)[1]["registered_count"], 1)
         bad = {**BODY, "rules": {"v": 1, "rules": {"unknown": {"on": True}}}}
         self.assertEqual(self.request("PUT", path, bad, cookie)[0], 400)
+        started = {**BODY, "rules": {"v": 1, "rules": {"charge_started": {"on": True}}}}
+        self.assertEqual(self.request("PUT", path, started, cookie)[0], 200)
+        self.assertEqual(self.request("PUT", path, BODY, cookie)[0], 200)
         bad_date = {**BODY, "service": {**BODY["service"], "last_date": "2026-02-30"}}
         self.assertEqual(self.request("PUT", path, bad_date, cookie)[0], 400)
         bad_months = {**BODY, "service": {**BODY["service"], "interval_months": 1000000}}

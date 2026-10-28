@@ -14,8 +14,10 @@ from datetime import date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+# charge_started arrived after the binding contract shipped, so a phone only names it once
+# /api/status advertises push_charge_started: an older dashboard refuses the whole binding.
 KINDS = frozenset((
-    "charge_complete", "charge_stopped", "soc_below", "left_unlocked",
+    "charge_started", "charge_complete", "charge_stopped", "soc_below", "left_unlocked",
     "panel_open", "tyre_pressure", "volt12_low", "service_due",
 ))
 THRESHOLDS = {"charge_complete": (80, 90, 100), "soc_below": (10, 20, 30)}

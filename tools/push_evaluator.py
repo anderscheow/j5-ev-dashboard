@@ -11,6 +11,13 @@ DEFAULT_THRESHOLDS = {"charge_complete": 80, "soc_below": 20}
 DEFAULT_SERVICE_KM = 10000
 DEFAULT_SERVICE_MONTHS = 12
 
+# charge_started waits this long into a charge, by the car's own flag, before it speaks: the car's
+# first time-to-done is taken before the charger has ramped up (see server._charge_elapsed_min).
+CHARGE_SETTLE_MIN = 5
+# ...and stays quiet about a charge older than this: a cold start or an upgrade mid-charge is not
+# the moment a charge started.
+CHARGE_RECENT_MIN = 60
+
 
 def _threshold(rules, kind):
     entry = rules.get(kind) or {}
@@ -101,6 +108,15 @@ def evaluate(rules, memory, snapshot, service, today=None):
             fired.add(kind)
             if raise_event and _on(rules, kind) and kind not in previous_fired:
                 events.append({"kind": kind, "value": value})
+
+    # Once per charge, quoting the car's time-to-done once it can be trusted. A server or frame
+    # without the car's flag has no elapsed time: announce the transition itself, with no estimate.
+    elapsed = snapshot.get("charge_elapsed_min")
+    remaining = snapshot.get("charge_remaining_min")
+    level("charge_started", charging and (elapsed is None or elapsed >= CHARGE_SETTLE_MIN),
+          remaining if elapsed is not None and remaining and remaining > 0 else None,
+          raise_event=(memory.get("charging") is False if elapsed is None
+                       else elapsed <= CHARGE_RECENT_MIN))
 
     ended = memory.get("charging") is True and not charging
     target = _threshold(rules, "charge_complete")

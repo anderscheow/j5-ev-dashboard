@@ -58,6 +58,8 @@ def alert_snapshot(summary):
                     "j5" not in model and "jaecoo" not in model else None)
     return {
         "charging": charging.get("active") is True,
+        "charge_elapsed_min": charging.get("elapsed_min"),
+        "charge_remaining_min": charging.get("remaining_min"),
         "battery": summary.get("battery"),
         "moving": summary.get("moving") is True,
         "unlocked": summary.get("unlocked") is True,
@@ -132,14 +134,29 @@ class TelemetryWindow:
         return self.server.alert_summary(data, now, tyre_frame=tyre)
 
 
+def _zone(time_zone):
+    try:
+        return ZoneInfo(time_zone)
+    except (ValueError, KeyError):
+        return ZoneInfo("UTC")
+
+
 def _local_date(ts, time_zone):
     """The phone's calendar day at ts: the service reminder counts days on the phone, and a
     dashboard on UTC would otherwise move a due date by one near midnight."""
-    try:
-        zone = ZoneInfo(time_zone)
-    except (ValueError, KeyError):
-        zone = ZoneInfo("UTC")
-    return datetime.fromtimestamp(ts, zone).date()
+    return datetime.fromtimestamp(ts, _zone(time_zone)).date()
+
+
+def _wire_value(kind, value, ts, time_zone):
+    """An event's value as the relay renders it.
+
+    The relay keeps no time zone, so charge_started's estimate -- minutes to done in the
+    evaluator, as in the app's -- goes out as the finish time in minutes past midnight on the
+    phone's clock, which the relay prints as HH:MM."""
+    if kind != "charge_started" or value is None:
+        return value
+    finish = datetime.fromtimestamp(ts + value * 60, _zone(time_zone))
+    return finish.hour * 60 + finish.minute
 
 
 class RelayClient:
@@ -272,7 +289,8 @@ class Dispatcher:
                         conn.execute("""INSERT OR IGNORE INTO push_outbox
                             (event_id,installation_id,kind,value,occurred_at,expires_at,next_attempt)
                             VALUES (?,?,?,?,?,?,?)""", (
-                            event_id, installation_id, event["kind"], event["value"],
+                            event_id, installation_id, event["kind"],
+                            _wire_value(event["kind"], event["value"], ts, time_zone),
                             ts, ts + EVENT_TTL, now))
             conn.execute("""UPDATE push_dispatcher_state SET cursor_ts=?,cursor_digest=?
                 WHERE singleton=1""", (ts, digest))

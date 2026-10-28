@@ -149,6 +149,8 @@ def decode(hexstr):
         d["speed"]    = int.from_bytes(b[14:16], "big") / 16.0
     if len(b) >= 52:
         d["tyre_raw"] = b[44:52].hex()
+    if len(b) > 57:
+        d["charging"] = b[57] == 1                        # car's own flag (server.decode charge_state)
     return d
 
 def connect(attempts=3):
@@ -279,11 +281,14 @@ def adaptive_loop(conn):
             if odo is not None: last_odo = odo
         else:
             miss += 1
-        # charge detector: SoC now above the window's low => still gaining => plugged in. Survives
-        # the 1%-coarse SoC that looks flat frame-to-frame, so a slow charge stays real-time. When
-        # the charge ends (or the car unplugs) the low catches up within CHG_LOOKBACK and releases.
+        # charge detector: the car's own flag when the frame carries one -- real-time from the
+        # first charging frame, so the start and the finish both land within ACTIVE, however
+        # slowly the charger moves the 1%-coarse SoC. Otherwise SoC now above the window's low =>
+        # still gaining => plugged in; when that charge ends the low catches up within
+        # CHG_LOOKBACK and releases.
         soc_hist = [(t, s) for (t, s) in soc_hist if now - t <= CHG_LOOKBACK]
-        charging = bool(soc_hist) and soc_hist[-1][1] > min(s for _t, s in soc_hist)
+        charging = (bool(st and st.get("charging")) or
+                    (bool(soc_hist) and soc_hist[-1][1] > min(s for _t, s in soc_hist)))
         awake = charging or time.time() < active_until
         if awake:                                      # on the road or plugged in -> near real-time.
             delay = ACTIVE                             # a momentary empty frame here is a transient WS
