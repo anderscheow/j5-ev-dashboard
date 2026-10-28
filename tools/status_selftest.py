@@ -90,7 +90,7 @@ class StatusTest(unittest.TestCase):
             "gated": False,
             "authed": True,
             "api_version": server.API_VERSION,
-            "capabilities": ["maintenance_guide", "service_centres"],
+            "capabilities": ["maintenance_guide", "service_centres", "maintenance_records"],
         })
         self.assertEqual(demo["api_version"], summary["api_version"])
 

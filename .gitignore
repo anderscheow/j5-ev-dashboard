@@ -3,6 +3,9 @@ apk/
 tools/*.jar
 capture/
 carlinko.db
+# the owner's maintenance log and receipt photos (tools/ when run without CARLINKO_DATA)
+maintenance.db
+tools/maintenance.db
 .playwright-mcp/
 dash-*.png
 token.txt

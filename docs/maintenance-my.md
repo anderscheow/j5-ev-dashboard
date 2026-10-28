@@ -33,3 +33,5 @@ that a particular centre can service every model; users should confirm before
 booking. The original locator and directions are linked in the app.
 
 Run `python3 tools/maintenance_selftest.py` after changing the schedule data.
+Run `python3 tools/maintenance_records_selftest.py` after changing the owner's
+maintenance log (`tools/maintenance_records.py`, the `/api/maintenance/*` routes).
