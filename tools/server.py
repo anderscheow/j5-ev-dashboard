@@ -2,13 +2,14 @@
 Serves the mobile PWA in ./web and a JSON API computed from carlinko.db.
 Run: python server.py [port]   (default 8088, binds 0.0.0.0 so Tailscale can reach it)
 """
-import os, sys, json, time, sqlite3, threading, math, calendar, urllib.request, urllib.parse
+import os, sys, json, time, sqlite3, threading, math, calendar, tempfile, urllib.request, urllib.parse
 import logging, traceback
 import hmac, hashlib, base64, secrets, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import known_cars          # per-model constants the telemetry never carries (pack size, tyre scale)
 import log_setup
 import maintenance
+import maintenance_records as maint
 
 log_setup.configure()
 LOG = logging.getLogger("carlinko.server")
@@ -43,6 +44,7 @@ CAPABILITIES = (
     "climate_seats",
     "maintenance_guide",
     "service_centres",
+    "maintenance_records",
 )
 
 # The operator explicitly enables the relay and asserts this dashboard is
@@ -62,7 +64,7 @@ def push_enabled():
     return push_dispatcher.healthy(PUSH_DB)
 
 def status_capabilities():
-    return (["maintenance_guide", "service_centres"] if DEMO else
+    return (["maintenance_guide", "service_centres", "maintenance_records"] if DEMO else
             [*CAPABILITIES, *(["push_alerts"] if push_enabled() else [])])
 
 _poll_lock = threading.Lock()
@@ -93,6 +95,10 @@ DEMO = ("--demo" in sys.argv) or (os.environ.get("CARLINKO_DEMO", "").lower() in
 _DATA = os.environ.get("CARLINKO_DATA") or HERE          # Docker data dir; else alongside the code
 DB   = os.path.join(_DATA, "carlinko.db") if os.environ.get("CARLINKO_DATA") else os.path.join(HERE, "..", "carlinko.db")
 PUSH_DB = os.path.join(_DATA, "push_alerts.db")
+# The owner's maintenance log and receipt images. Demo mode keeps a scratch copy, so a
+# visitor's test records never land beside the code and vanish with the process.
+MAINT_DB = (os.path.join(tempfile.mkdtemp(prefix="carlinko-demo-"), "maintenance.db") if DEMO
+            else os.path.join(_DATA, "maintenance.db"))
 WEB  = os.path.join(HERE, "..", "web")
 
 def _creds():
@@ -1904,8 +1910,11 @@ class H(BaseHTTPRequestHandler):
         super().send_error(code, message, explain)
     def _send(self, code, body, ctype, extra=None):
         path = self.path.split("?", 1)[0]
+        # IDs that grant access to something are never logged.
         logged_path = ("/api/push/installations/{id}"
-                       if path.startswith("/api/push/installations/") else path)
+                       if path.startswith("/api/push/installations/") else
+                       "/api/maintenance/receipts/{id}"
+                       if path.startswith("/api/maintenance/receipts/") else path)
         failed = False
         if path.startswith("/api/") and "json" in ctype:
             try:
@@ -1992,6 +2001,20 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_exception("GET /api/service-centres failed", e)
                 self._send(502, b'{"error":"service centre search unavailable"}', "application/json")
+            return
+        if path == "/api/maintenance/records":         # the whole log: preferences + every record
+            try:
+                self._send(200, json.dumps(maint.log(MAINT_DB)).encode(), "application/json")
+            except Exception as e:
+                _log_exception("GET /api/maintenance/records failed", e)
+                self._send(500, b'{"error":"maintenance log unavailable"}', "application/json")
+            return
+        if path.startswith("/api/maintenance/receipts/"):
+            found = maint.receipt(MAINT_DB, path[len("/api/maintenance/receipts/"):])
+            if found is None:
+                self._send(404, b'{"error":"no such receipt"}', "application/json"); return
+            mime, blob = found
+            self._send(200, blob, mime)
             return
         if path == "/api/controls":                    # what this car supports + opcodes to test
             if not self._authed():
@@ -2146,6 +2169,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = self.path.split("?", 1)[0]
+        if path.startswith("/api/maintenance/"):
+            self._maintenance_write(path); return
         prefix = "/api/push/installations/"
         if not path.startswith(prefix) or "/" in path[len(prefix):]:
             self._send(404, b'{"error":"not found"}', "application/json"); return
@@ -2173,6 +2198,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = self.path.split("?", 1)[0]
+        if path.startswith("/api/maintenance/"):
+            self._maintenance_write(path); return
         prefix = "/api/push/installations/"
         if not path.startswith(prefix) or "/" in path[len(prefix):]:
             self._send(404, b'{"error":"not found"}', "application/json"); return
@@ -2192,8 +2219,53 @@ class H(BaseHTTPRequestHandler):
             self._send(500, b'{"error":"deletion failed"}', "application/json"); return
         self._send(200, b'{"ok":true}', "application/json")
 
+    def _maintenance_write(self, path):
+        """Writes to the maintenance log: a record (PUT/DELETE
+        /api/maintenance/records/{km}?model=), the guide preferences (PUT
+        /api/maintenance/preferences) and a receipt image (POST
+        /api/maintenance/receipts, raw bytes). Every body is validated whole
+        before anything is stored."""
+        if not self._authed():
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        records = "/api/maintenance/records/"
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if self.command == "POST" and path == "/api/maintenance/receipts":
+                if not 0 < n <= maint.RECEIPT_MAX:
+                    raise ValueError("receipt must be 1..%d bytes" % maint.RECEIPT_MAX)
+                result = maint.add_receipt(MAINT_DB, self.rfile.read(n))
+            elif self.command == "PUT" and path == "/api/maintenance/preferences":
+                if not 0 < n <= 1024:
+                    raise ValueError("invalid body size")
+                maint.put_preferences(MAINT_DB, maint.validate_preferences(json.loads(self.rfile.read(n))))
+                result = {"ok": True}
+            elif path.startswith(records) and self.command in ("PUT", "DELETE"):
+                km = maint.valid_km(path[len(records):])
+                model = maint.valid_model((q.get("model") or [""])[0])
+                if self.command == "DELETE":
+                    maint.delete_record(MAINT_DB, model, km)
+                    result = {"ok": True}
+                else:
+                    if not 0 < n <= maint.RECORD_MAX:
+                        raise ValueError("invalid body size")
+                    record = maint.validate_record(km, json.loads(self.rfile.read(n)))
+                    result = maint.put_record(MAINT_DB, model, record)
+            else:
+                self._send(404, b'{"error":"not found"}', "application/json"); return
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            self._send(400, json.dumps({"error": str(e)[:120]}).encode(), "application/json")
+            return
+        except Exception as e:
+            _log_exception("%s maintenance write failed" % self.command, e)
+            self._send(500, b'{"error":"maintenance log unavailable"}', "application/json")
+            return
+        self._send(200, json.dumps(result).encode(), "application/json")
+
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/maintenance/receipts":
+            self._maintenance_write(path); return
         if path == "/api/login":
             try:
                 n = int(self.headers.get("Content-Length") or 0)
