@@ -32,7 +32,7 @@ def binding(installation_id, *, rules=RULES, plus=True, service=SERVICE, time_zo
 
 
 def frame(battery, odometer, *, volt12=12.6, unlocked=False, doors=0, tyre=None,
-          charge_state=0, charge_power=0.0):
+          charge_state=0, charge_power=0.0, charge_remain=0):
     """A raw status blob at the offsets server.decode() reads."""
     b = bytearray(72)
     b[2] = doors
@@ -42,6 +42,7 @@ def frame(battery, odometer, *, volt12=12.6, unlocked=False, doors=0, tyre=None,
     b[28] = battery
     b[44:52] = bytes(tyre or [0xFF] * 8)
     b[57] = charge_state
+    b[58:60] = charge_remain.to_bytes(2, "big")
     b[62:64] = round(charge_power * 10).to_bytes(2, "big")
     return b.hex()
 
@@ -70,9 +71,59 @@ class AlertParityTest(unittest.TestCase):
                                        snapshot(battery=34), SERVICE)
         self.assertEqual(events, [{"kind": "charge_stopped", "value": 34}])
 
+    def test_charge_started_waits_for_the_estimate_and_speaks_once(self):
+        rules = {"charge_started": {"on": True}}
+        # Plugged in: the car's first estimate is taken before the charger has ramped up.
+        events, memory = evaluator.evaluate(
+            rules, {"charging": False, "soc": 22},
+            snapshot(charging=True, battery=22, charge_elapsed_min=0,
+                     charge_remaining_min=351), SERVICE)
+        self.assertEqual(events, [])
+        self.assertNotIn("charge_started", memory["fired"])
+        events, memory = evaluator.evaluate(
+            rules, memory, snapshot(charging=True, battery=25, charge_elapsed_min=5,
+                                    charge_remaining_min=141), SERVICE)
+        self.assertEqual(events, [{"kind": "charge_started", "value": 141}])
+        events, memory = evaluator.evaluate(
+            rules, memory, snapshot(charging=True, battery=26, charge_elapsed_min=6,
+                                    charge_remaining_min=140), SERVICE)
+        self.assertEqual(events, [])
+        # Unplugged re-arms it for the next charge.
+        _, memory = evaluator.evaluate(rules, memory, snapshot(battery=26), SERVICE)
+        self.assertNotIn("charge_started", memory["fired"])
+
+    def test_charge_started_is_quiet_about_an_old_charge_and_a_missing_estimate(self):
+        rules = {"charge_started": {"on": True}}
+        # A cold start or an upgrade an hour and a half into a charge: not news.
+        events, memory = evaluator.evaluate(
+            rules, {}, snapshot(charging=True, charge_elapsed_min=90,
+                                charge_remaining_min=60), SERVICE)
+        self.assertEqual(events, [])
+        self.assertIn("charge_started", memory["fired"])
+        # The car gave no estimate, or a finished one: announced with none.
+        for remaining in (None, 0):
+            events, _ = evaluator.evaluate(
+                rules, {"charging": False}, snapshot(charging=True, charge_elapsed_min=5,
+                                                     charge_remaining_min=remaining), SERVICE)
+            self.assertEqual(events, [{"kind": "charge_started", "value": None}])
+
+    def test_charge_started_without_the_cars_flag_follows_the_transition(self):
+        rules = {"charge_started": {"on": True}}
+        # An older server, or a charge only the SoC detector saw: no elapsed time to wait on,
+        # and no estimate it could vouch for.
+        events, _ = evaluator.evaluate(
+            rules, {"charging": False}, snapshot(charging=True, charge_remaining_min=351),
+            SERVICE)
+        self.assertEqual(events, [{"kind": "charge_started", "value": None}])
+        events, memory = evaluator.evaluate(rules, {}, snapshot(charging=True), SERVICE)
+        self.assertEqual(events, [])
+        events, _ = evaluator.evaluate(rules, memory, snapshot(charging=True), SERVICE)
+        self.assertEqual(events, [])
+
     def test_conditions_and_rearming_match_dart(self):
         rules = {kind: {"on": True} for kind in registrations.KINDS
-                 if kind not in ("charge_complete", "charge_stopped", "soc_below")}
+                 if kind not in ("charge_started", "charge_complete", "charge_stopped",
+                                 "soc_below")}
         first = snapshot(unlocked=True, doors=1, tyre_status="Check tyres",
                          volt12_status="low", volt12=11.7)
         events, memory = evaluator.evaluate(rules, {"charging": False, "soc": 60},
@@ -296,6 +347,22 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual([sent[0] for sent in self.relay.sent],
                          ["installation_1234567890", "installation_abcdefghij"])
 
+    def test_charge_started_goes_out_as_the_finish_time_on_the_phones_clock(self):
+        rules = {"v": 1, "rules": {"charge_started": {"on": True}}}
+        registrations.put(self.push, binding("installation_1234567890", rules=rules,
+                                             time_zone="Asia/Kuala_Lumpur"))
+        self.row(self.now - 20, "aaa", battery=22)
+        self.worker.run_once()
+        self.latest["charging"] = {"active": True, "elapsed_min": 5, "remaining_min": 141}
+        self.row(self.now - 10, "bbb", battery=25)
+        self.worker.run_once()
+        self.assertEqual(len(self.relay.sent), 1)
+        sent = self.relay.sent[0][2]
+        finish = datetime.fromtimestamp(self.now - 10 + 141 * 60, dispatch.ZoneInfo(
+            "Asia/Kuala_Lumpur"))
+        self.assertEqual((sent["kind"], sent["value"]),
+                         ("charge_started", finish.hour * 60 + finish.minute))
+
     def test_new_worker_takes_over_after_lease_expires(self):
         self.row(self.now - 10, "aaa", battery=25)
         self.worker.run_once()
@@ -444,6 +511,30 @@ class TelemetryWindowTest(unittest.TestCase):
         driving = self.check(ts, frame(battery + 11, odo + 1, unlocked=True))
         self.assertTrue(driving["moving"])
         self.assertGreater(len(self.checked), 40)
+
+    def test_a_charge_the_car_flagged_ends_when_the_car_says_so(self):
+        # The SoC detector holds a session open for IDLE_GAP after its last rise; a charge the car
+        # flagged is over the moment the flag drops -- complete, then unplugged.
+        ts, odo, battery = 1_780_000_000, 1000, 60
+        self.insert(ts, frame(battery, odo))
+        ts += 60
+        self.check(ts, frame(battery, odo, charge_state=1, charge_remain=351))
+        for minute in range(1, 31):
+            ts += 60
+            charging = self.check(ts, frame(battery + minute // 2, odo, charge_state=1,
+                                            charge_power=6.1, charge_remain=140 - minute))
+        self.assertTrue(charging["charging"])
+        self.assertEqual(charging["charge_elapsed_min"], 30)
+        self.assertEqual(charging["charge_remaining_min"], 110)
+        ts += 60
+        complete = self.check(ts, frame(battery + 15, odo, charge_state=2))
+        self.assertFalse(complete["charging"])
+        self.assertIsNone(complete["charge_elapsed_min"])
+        ts += 60
+        self.assertFalse(self.check(ts, frame(battery + 15, odo))["charging"])
+        with patch("time.time", return_value=ts + 5):
+            session = server.summary()["charging"]["session"]
+        self.assertFalse(session["ongoing"])
 
 
 if __name__ == "__main__":
