@@ -63,6 +63,12 @@ def _tyre_problem(snapshot):
     return False
 
 
+# server.VOLT12_LOW: the dashboard's "low" line. A reading at or above it is never quoted beside a
+# low verdict -- the verdict is the week's lowest held level, and the reading is the car right now,
+# 13.4 V while it is awake and the DC-DC converter is topping the 12V up.
+VOLT12_LOW = 12.2
+
+
 def _volt12_low(snapshot):
     status = snapshot.get("volt12_status")
     if status is not None:
@@ -118,11 +124,12 @@ def evaluate(rules, memory, snapshot, service, today=None):
     panels = _open_panels(snapshot)
     level("panel_open", parked and panels != 0, panels)
     level("tyre_pressure", _tyre_problem(snapshot))
-    # A low status can arrive without a usable reading (0 V is the decoder's "absent"). The
-    # event still goes out, with no number, and the relay picks the copy that quotes none.
+    # The event quotes the reading only when the reading is itself low. Otherwise -- no usable
+    # reading (0 V is the decoder's "absent"), or a healthy one beside a low week -- it goes out
+    # with no number, and the relay picks the copy that quotes none.
     volts = snapshot.get("volt12")
     level("volt12_low", _volt12_low(snapshot),
-          volts if type(volts) in (int, float) and 0 < volts <= 20 else None)
+          volts if type(volts) in (int, float) and 0 < volts < VOLT12_LOW else None)
     level("service_due", _service_due(service, snapshot.get("odometer"), today))
     # The relay's service copy has no numeric placeholder; Dart carries kmRemaining.
     return events, {"v": 2, "charging": charging, "soc": battery,

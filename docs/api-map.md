@@ -134,6 +134,28 @@ than me" and degrade gracefully rather than guessing at the new shape.
 This exists because there are now clients this repo does not control — see issue #12 — so a
 careless field rename becomes somebody else's outage rather than just ours.
 
+### The 12V watch — `volt12`, `volt12_min7d`, `volt12_status`
+
+`volt12` is the car's reading right now. While the car is awake the DC-DC converter holds the 12V
+at 13.4–14.3 V, so a high `volt12` says nothing about the battery's charge. `volt12_min7d` is the
+lowest level the 12V **held for at least five minutes** over the last seven days, and
+`volt12_status` is that number judged against two lines (`VOLT12_LOW`, `VOLT12_CRITICAL` in
+`tools/server.py`): `low` under 12.2 V (about half charged), `critical` under 11.9 V (flat enough
+that the car may not wake). Both fields are absent until some reading has held that long.
+
+Calibrated on 2026-10-29 against nine weeks of one car's telemetry. The car reports in steps of about
+0.21 V (12.15, 12.36, 12.57 …), and a healthy battery parked overnight rests at 12.36–12.57 V. The
+original rule took the plain 7-day minimum and called anything under 12.5 V `low`, so one ordinary
+night kept the status `low` for a week. The minimum also picked up the under-a-minute sag when the
+car wakes (12.15 V at unlock on a battery resting at 12.36). The five-minute hold drops the sag. A
+reading flickering between two steps counts as the higher of the two. The field names, types,
+units and meaning — the week's 12V low and a verdict on it — are unchanged, so this did not bump
+`api_version`.
+
+A client that alerts on `volt12_status` must not quote `volt12` beside it unless `volt12` is itself
+under the `low` line: "It reads 13.4 V. The car may not wake up." is what that produced. The push
+evaluator sends the event with no value in that case (`push_evaluator.VOLT12_LOW`).
+
 ### Public status and capabilities — `/api/status`
 
 `GET /api/status` is public, including when the dashboard password gate is locked. Its existing

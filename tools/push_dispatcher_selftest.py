@@ -143,6 +143,68 @@ class AlertParityTest(unittest.TestCase):
             rules, {}, snapshot(volt12_status="critical", volt12=11.7), SERVICE)
         self.assertEqual(events, [{"kind": "volt12_low", "value": 11.7}])
 
+    def test_low_12v_week_beside_a_healthy_reading_quotes_no_number(self):
+        # The status is the week's lowest held level; 13.4 V is the car awake right now.
+        # "It reads 13.4V. The car may not wake up." contradicts itself.
+        rules = {"volt12_low": {"on": True}}
+        for volts in (13.4, 12.57, evaluator.VOLT12_LOW):
+            events, _ = evaluator.evaluate(
+                rules, {}, snapshot(volt12_status="low", volt12=volts), SERVICE)
+            self.assertEqual(events, [{"kind": "volt12_low", "value": None}])
+        events, _ = evaluator.evaluate(
+            rules, {}, snapshot(volt12_status="low", volt12=12.15), SERVICE)
+        self.assertEqual(events, [{"kind": "volt12_low", "value": 12.15}])
+
+    def test_evaluator_quotes_against_the_dashboards_low_line(self):
+        self.assertEqual(evaluator.VOLT12_LOW, server.VOLT12_LOW)
+
+
+class Volt12WatchTest(unittest.TestCase):
+    """The 12V status is the lowest level the battery *held* over seven days."""
+
+    NOW = 1_780_000_000
+
+    def watch(self, readings):
+        """readings: [(seconds before NOW, volts)]."""
+        data = [(self.NOW - ago, "", {"volt12": volts}) for ago, volts in sorted(
+            readings, key=lambda r: -r[0])]
+        return server._volt12_watch(data, self.NOW)
+
+    def parked(self, volts, hours=8, start=3 * 86400):
+        """A night parked: the car's cached reading, polled every 30 s."""
+        return [(start - s, volts) for s in range(0, hours * 3600, 30)]
+
+    def test_an_ordinary_night_is_ok(self):
+        # A healthy battery rests at 12.36-12.57 V; the old 12.5 V line called that "low".
+        watch = self.watch(self.parked(12.36) + self.parked(12.57, start=86400))
+        self.assertEqual(watch, {"volt12_min7d": 12.36, "volt12_status": "ok"})
+
+    def test_a_sag_while_the_car_wakes_is_not_counted(self):
+        sag = [(3 * 86400 + 60, 12.15), (3 * 86400 + 30, 12.15), (3 * 86400, 13.42)]
+        watch = self.watch(self.parked(12.36, start=4 * 86400) + sag + self.parked(13.42))
+        self.assertEqual(watch["volt12_status"], "ok")
+        self.assertEqual(watch["volt12_min7d"], 12.36)
+
+    def test_a_battery_that_stays_low_is_low_then_critical(self):
+        self.assertEqual(self.watch(self.parked(12.15)),
+                         {"volt12_min7d": 12.15, "volt12_status": "low"})
+        self.assertEqual(self.watch(self.parked(11.73)),
+                         {"volt12_min7d": 11.73, "volt12_status": "critical"})
+
+    def test_a_reading_flickering_between_two_steps_holds_the_higher(self):
+        flicker = [(3 * 86400 - s, 11.73 if (s // 30) % 2 else 11.94)
+                   for s in range(0, 3600, 30)]
+        self.assertEqual(self.watch(flicker),
+                         {"volt12_min7d": 11.94, "volt12_status": "low"})
+
+    def test_a_week_old_low_has_expired(self):
+        watch = self.watch(self.parked(11.73, start=8 * 86400) + self.parked(12.57))
+        self.assertEqual(watch["volt12_status"], "ok")
+
+    def test_no_opinion_until_a_reading_has_held(self):
+        self.assertEqual(self.watch([(60, 11.73), (30, 11.73)]), {})
+        self.assertEqual(self.watch([]), {})
+
     def test_service_due_counts_days_on_the_phone(self):
         # Due 31 March. On 2 March that is 29 days away (due); on 1 March, 30 (not yet).
         rules = {"service_due": {"on": True}}
@@ -421,8 +483,8 @@ class TelemetryWindowTest(unittest.TestCase):
             ts = start + hour * 3600
             odo += 3 if hour % 5 == 0 else 0
             battery = max(30, battery - (1 if hour % 7 == 0 else 0))
-            # One dip below 12.5 V four days from the end makes the 7-day status "low".
-            volts = 12.3 if hour == 9 * 24 - 96 else 12.6
+            # Two hours parked at 12.0 V four days from the end make the 7-day status "low".
+            volts = 12.0 if 9 * 24 - 98 <= hour <= 9 * 24 - 96 else 12.6
             self.insert(ts, frame(battery, odo, volt12=volts))
         parked = self.check(ts + 60, frame(battery, odo))
         self.assertEqual(parked["tyre_status"], "Check tyres")
