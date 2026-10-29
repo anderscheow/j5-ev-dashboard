@@ -1108,23 +1108,17 @@ function windowsOpen(){
   return S.windows !== 0;
 }
 
-// ac_temp_c (byte 24): a raw degC reading, validated against the Omoda E5's A/C target temp.
-// The J5 has read wildly different things under this same byte over time -- 159-169 in earlier
-// logs, and a near-static 47-51 now that barely moves with A/C on/off or the hour of day. Neither
-// is a plausible cabin-air temperature, so on a J5 this byte is unverified and refused rather than
-// shown as if it were a real reading (see #5 for the E5 validation this was carried over from).
-function cabinTemp(){
-  if(isJ5()) return null;
-  return (S.ac_temp_c && S.ac_temp_c < 60) ? S.ac_temp_c : null;
-}
-
-// On the J5, byte 24 is the A/C SET-POINT in half degrees, not a cabin reading: 2 x degC with an
-// optional 0x80 flag (Jun-Aug 2026 it read 170-181, since the early-Sep OTA 38-53 -- both are
-// 19-26.5 degC, odd values are the .5 steps). Same encoding the 7411 set-point command uses.
+// ac_temp_c (byte 24) is the A/C *set-point* at twice its degC -- the byte `7411` writes, with the
+// top bit masked off (some firmware sets it: 172 and 44 are both 22 degC). Verified on a Tiggo 7
+// CSH: the 22.5 and 23 degC commands of 2026-10-22 read back as 45 and 46. It is not cabin air,
+// which is why the J5's 159-169 and near-static 47-51 looked implausible: they decode to 15.5-25.5
+// degC set-points, and a set-point does not move with A/C on/off or the hour. Anything decoding
+// outside 15-32 degC is no reading. The Voltmoss app decodes the same way (BodyState.acTemp).
 function acSetPoint(){
-  if(!isJ5() || !S.ac_temp_c) return null;
-  const c = (S.ac_temp_c & 0x7F) / 2;
-  return (c >= 15 && c <= 32) ? c : null;
+  const b = S.ac_temp_c;
+  if(b == null || b < 0 || b > 255) return null;
+  const c = (Math.round(b) & 0x7f) / 2;
+  return c >= 15 && c <= 32 ? c : null;
 }
 
 function doorSummary(){
@@ -1175,18 +1169,15 @@ function row(ic, label, val, cls, page){
     (page ? CHEV : '') + '</' + tag + '>';
 }
 
-let acSynced = false;
 function renderCards(){
   const ds = doorSummary();
-  const sp = acSetPoint();
-  if(!acSynced && sp != null){ acTarget = sp; acSynced = true; }   // start the stepper at the car's own set-point
   const e = S.energy || {};
   const cons = e.consumption != null ? e.consumption + ' kWh/100km' : 'No data yet';
   const tyreSub = S.tyre_indirect === false
     ? (S.tyre_status === 'Normal' ? 'Normal' : 'Check tyres')
     : (S.tyre_status || 'Status only');
-  const ct = cabinTemp();
-  const cabin = ct != null ? ct + '\u00b0C Cabin Temp' : (S.ac_on ? 'On' : 'Not turned on');
+  const sp = acSetPoint();
+  const cabin = S.ac_on ? 'On' + (sp != null ? ' \u00b7 ' + sp + '\u00b0C' : '') : 'Not turned on';
   const seatsKnown = (S.seat_heat && (S.seat_heat[0] || S.seat_heat[1])) ||
                      (S.seat_vent && (S.seat_vent[0] || S.seat_vent[1]));
   const seatCaps = seatControls().length > 0;
@@ -1244,7 +1235,21 @@ function renderCards(){
 }
 
 // ---- subpages ----
-let acTarget = 24, acTimer = null;
+// A/C set-point. The target shown is the car's own report of it (acSetPoint) where it gives one,
+// and otherwise the last one stepped to here. The report trails a command by a poll or more, so a
+// reading is adopted only when it *changes* -- adopted on every poll, the stale value would undo a
+// step the car had just accepted.
+let acTarget = 24, acTimer = null, acReported;
+// After each poll: take the car's set-point when it differs from the last one seen, unless a step
+// is still waiting to be sent. Returns whether the target moved.
+function adoptSetPoint(){
+  const sp = acSetPoint();
+  if(sp == null || sp === acReported || acTimer) return false;
+  acReported = sp;
+  const r = acRange();
+  acTarget = Math.min(r.mx, Math.max(r.mn, sp));
+  return true;
+}
 function acRange(){                       // the car's own set-point range and step (J5: 15.5-30.5, 0.5)
   const c = (CAPS && CAPS.ac) || {};
   return {mn: c.min != null ? c.min : 16, mx: c.max != null ? c.max : 30, st: c.step || 0.5};
@@ -1252,7 +1257,7 @@ function acRange(){                       // the car's own set-point range and s
 function sendTemp(){
   // debounced so stepping does not spam the car
   clearTimeout(acTimer);
-  acTimer = setTimeout(() => fire(tempOp(acTarget)), 800);
+  acTimer = setTimeout(() => { acTimer = null; fire(tempOp(acTarget)); }, 800);
 }
 // Seat rows this car offers, from its own vehicleControlConfig (CAPS.seats). Each row carries its
 // kind, seat, highest level and the level the status blob reports now (front seats only).
@@ -1372,11 +1377,9 @@ function renderAc(){
     ' aria-pressed="' + !x[1] + '">Off</button>' +
     '<button data-xop="' + x[2] + '01"' + (x[1] ? ' class="on"' : '') +
     ' aria-pressed="' + !!x[1] + '">On</button></span></div>').join('') + '</div>' : '';
-  const ct = cabinTemp();
-  const cabin = ct != null ? ct + '°C' : null;
+  const sp = acSetPoint();
   el.innerHTML =
-    '<div class="acsub ov">' + (cabin ? 'Cabin now ' + cabin
-      : (acSetPoint() != null ? 'Car is set to ' + acSetPoint() + '°C' : 'Set a target, then power on')) + '</div>' +
+    '<div class="acsub ov">' + (sp != null ? 'Car is set to ' + sp + '°C' : 'Set a target, then power on') + '</div>' +
     (FLOW_OK ? huFlowHtml(ac) : '') +
     '<div class="acbig"><span class="side">' + Math.max(mn, acTarget - st) + '</span>' +
     '<span class="cur num">' + acTarget + '<u>°C</u></span>' +
@@ -2418,6 +2421,7 @@ document.querySelectorAll('.tabbar button').forEach(b => b.onclick = () => {
 async function load(){
   try{
     S = await api('api/summary');
+    adoptSetPoint();
     renderHero(); renderQA(); renderCharging(); renderCards();
     if(S._acctDone) renderAcct();
     if(openKey === 'doors') liveDoors();
@@ -2429,6 +2433,7 @@ $('hRefresh').onclick = async () => {
   // api/refresh pokes the car and answers with the fresh summary, so no second load() round trip
   try{
     S = await api('api/refresh');
+    adoptSetPoint();
     renderHero(); renderQA(); renderCharging(); renderCards();
     if(S._acctDone) renderAcct();
     if(openKey === 'doors') liveDoors();
