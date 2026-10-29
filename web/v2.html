@@ -1051,14 +1051,17 @@ function windowsOpen(){
   return S.windows !== 0;
 }
 
-// ac_temp_c (byte 24): a raw degC reading, validated against the Omoda E5's A/C target temp.
-// The J5 has read wildly different things under this same byte over time -- 159-169 in earlier
-// logs, and a near-static 47-51 now that barely moves with A/C on/off or the hour of day. Neither
-// is a plausible cabin-air temperature, so on a J5 this byte is unverified and refused rather than
-// shown as if it were a real reading (see #5 for the E5 validation this was carried over from).
-function cabinTemp(){
-  if(isJ5()) return null;
-  return (S.ac_temp_c && S.ac_temp_c < 60) ? S.ac_temp_c : null;
+// ac_temp_c (byte 24) is the A/C *set-point* at twice its degC -- the byte `7411` writes, with the
+// top bit masked off (some firmware sets it: 172 and 44 are both 22 degC). Verified on a Tiggo 7
+// CSH: the 22.5 and 23 degC commands of 2026-10-22 read back as 45 and 46. It is not cabin air,
+// which is why the J5's 159-169 and near-static 47-51 looked implausible: they decode to 15.5-25.5
+// degC set-points, and a set-point does not move with A/C on/off or the hour. Anything decoding
+// outside 15-32 degC is no reading. The Voltmoss app decodes the same way (BodyState.acTemp).
+function carSetPoint(){
+  const b = S.ac_temp_c;
+  if(b == null || b < 0 || b > 255) return null;
+  const c = (Math.round(b) & 0x7f) / 2;
+  return c >= 15 && c <= 32 ? c : null;
 }
 
 function doorSummary(){
@@ -1116,8 +1119,8 @@ function renderCards(){
   const tyreSub = S.tyre_indirect === false
     ? (S.tyre_status === 'Normal' ? 'Normal' : 'Check tyres')
     : (S.tyre_status || 'Status only');
-  const ct = cabinTemp();
-  const cabin = ct != null ? ct + '\u00b0C Cabin Temp' : (S.ac_on ? 'On' : 'Not turned on');
+  const sp = carSetPoint();
+  const cabin = S.ac_on ? 'On' + (sp != null ? ' \u00b7 ' + fmtT(sp) + '\u00b0C' : '') : 'Not turned on';
   const seatsKnown = (S.seat_heat && (S.seat_heat[0] || S.seat_heat[1])) ||
                      (S.seat_vent && (S.seat_vent[0] || S.seat_vent[1]));
   const chgSub = (S.charging && S.charging.active)
@@ -1171,12 +1174,24 @@ function renderCards(){
 }
 
 // ---- subpages ----
-// A/C set-point. The car never reports its set temperature (byte 24 is unverified, see cabinTemp),
-// so the target shown is the last one sent from this device. The server encodes and range-checks
-// it (POST /api/actemp): one byte = 0x80 + 2 x degC, so the car steps in half degrees.
-let acTarget = readAcTarget(), acTimer = null;
+// A/C set-point. The target shown is the car's own report of it (carSetPoint) where it gives one,
+// and otherwise the last one sent from this device. The report trails a command by a poll or more,
+// so a reading is adopted only when it *changes* -- adopted on every poll, the stale value would
+// undo a step the car had just accepted. The server encodes and range-checks a send
+// (POST /api/actemp): one byte = 0x80 + 2 x degC, so the car steps in half degrees.
+let acTarget = readAcTarget(), acTimer = null, acReported;
 function readAcTarget(){
   try{ const v = parseFloat(localStorage.getItem('acTarget')); return isNaN(v) ? 22 : v; }catch(e){ return 22; }
+}
+// After each poll: take the car's set-point when it differs from the last one seen, unless a step
+// is still waiting to be sent. Returns whether the target moved.
+function adoptSetPoint(){
+  const sp = carSetPoint();
+  if(sp == null || sp === acReported || acTimer) return false;
+  acReported = sp;
+  const r = acRange();
+  acTarget = Math.min(r.mx, Math.max(r.mn, sp));
+  return true;
 }
 function acRange(){
   const c = (CAPS && CAPS.ac) || {};
@@ -1189,6 +1204,7 @@ function stepTemp(dir){
   try{ localStorage.setItem('acTarget', acTarget); }catch(e){}
   clearTimeout(acTimer);                         // debounced so stepping does not spam the car
   acTimer = setTimeout(() => {
+    acTimer = null;
     const t = fmtT(acTarget);
     send('/api/actemp', {celsius: acTarget}, 'A/C set to ' + t + '°C', 'set the A/C to ' + t + '°C');
   }, 800);
@@ -1244,9 +1260,9 @@ function renderAc(){
 }
 // the set-point block re-renders on its own, so stepping never resets the editors below it
 function renderAcTemp(){
-  const r = acRange(), ct = cabinTemp();
+  const r = acRange(), sp = carSetPoint();
   $('acTemp').innerHTML =
-    '<div class="acsub ov">' + (ct != null ? 'Cabin now ' + ct + '°C' : 'Set a target, then power on') + '</div>' +
+    '<div class="acsub ov">' + (sp != null ? 'The car is set to ' + fmtT(sp) + '°C' : 'Set a target, then power on') + '</div>' +
     '<div class="acbig"><span class="side">' + fmtT(Math.max(r.mn, acTarget - r.st)) + '</span>' +
     '<span class="cur num">' + fmtT(acTarget) + '<u>°C</u></span>' +
     '<span class="side">' + fmtT(Math.min(r.mx, acTarget + r.st)) + '</span></div>' +
@@ -2233,6 +2249,7 @@ document.querySelectorAll('.tabbar button').forEach(b => b.onclick = () => {
 async function load(){
   try{
     S = await api('/api/summary');
+    if(adoptSetPoint() && openKey === 'ac') renderAcTemp();
     renderHero(); renderQA(); renderCharging(); renderCards();
     if(S._acctDone) renderAcct();
   }catch(e){ /* auth redirect handled in api() */ }
