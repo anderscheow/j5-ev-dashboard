@@ -613,8 +613,10 @@ def decode(hexstr):
         d["windows"] = b[8]                                 # 2 bits per window: closed/open bits,
                                                             # both clear = partial (E5, #5)
         d["sunroof_open"] = bool(b[9])                      # 0 = fully closed (E5, #5)
-        d["ac_temp_c"] = b[24] if b[24] else None           # A/C target temp, raw degC (E5, #5);
-                                                            # the J5 reads 159-169 here -> model-specific
+        # A/C set-point, passed through as the raw byte: 2 x degC with the top bit sometimes set
+        # (the byte `7411` writes) -- 44 or 172 = 22 degC. Verified on a Tiggo 7 CSH; clients
+        # decode it (see docs/api-map.md). The field name predates the decode and is kept.
+        d["ac_temp_c"] = b[24] if b[24] else None
         d["seat_heat"] = [b[32], b[33]]                     # L, R (0 = off)
         d["seat_vent"] = [b[37], b[38]]                     # L, R (0 = off)
         d["defrost_front"] = bool(b[42])
