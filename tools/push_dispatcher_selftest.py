@@ -193,11 +193,13 @@ class AlertParityTest(unittest.TestCase):
         events, _ = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000 + 2 * dwell)
         self.assertEqual(events, [])
 
-    def test_first_evaluation_latches_a_dwell_condition_silently(self):
+    def test_first_evaluation_does_not_wait(self):
+        # The dispatcher's baseline pass drops these events and keeps the latch, so a car already
+        # open when a phone registers is never announced -- and never waits for a dwell either.
         rules = {"left_unlocked": {"on": True}}
-        events, memory = evaluator.evaluate(rules, {}, snapshot(unlocked=True), SERVICE, ts=1000)
-        self.assertEqual(events, [])
+        _, memory = evaluator.evaluate(rules, {}, snapshot(unlocked=True), SERVICE, ts=1000)
         self.assertEqual(memory["fired"], ["left_unlocked"])
+        self.assertNotIn("since", memory)
 
     def test_panel_open_says_what_is_open(self):
         rules = {"panel_open": {"on": True}}

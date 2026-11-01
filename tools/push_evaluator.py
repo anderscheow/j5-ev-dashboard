@@ -119,8 +119,8 @@ def evaluate(rules, memory, snapshot, service, today=None, ts=None):
         if active and dwell and ts is not None and not first and kind not in previous_fired:
             began = previous_since.get(kind)
             began = ts if type(began) is not int or began > ts else began
-            since[kind] = began
             if ts - began < dwell:
+                since[kind] = began
                 return  # not latched yet: nothing fires, and nothing is remembered as seen
         if active:
             fired.add(kind)
