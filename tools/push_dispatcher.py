@@ -20,11 +20,13 @@ from contextlib import closing
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import charge_activity
 import push_evaluator
 import push_registrations as registrations
 
 
 EVENT_TTL = 15 * 60
+ACTIVITY_TTL = 10 * 60
 FRAME_MAX_AGE = 120
 LEASE_SECONDS = 15
 LOG = logging.getLogger("carlinko.push_dispatcher")
@@ -60,6 +62,9 @@ def alert_snapshot(summary):
         "charging": charging.get("active") is True,
         "charge_elapsed_min": charging.get("elapsed_min"),
         "charge_remaining_min": charging.get("remaining_min"),
+        "charge_rate_kw": charging.get("rate_kw"),
+        "charge_mode": charging.get("mode"),
+        "charge_state": charging.get("state"),
         "battery": summary.get("battery"),
         "moving": summary.get("moving") is True,
         "unlocked": summary.get("unlocked") is True,
@@ -159,6 +164,11 @@ def _wire_value(kind, value, ts, time_zone):
     return finish.hour * 60 + finish.minute
 
 
+def _minute_of_day(at, time_zone):
+    moment = datetime.fromtimestamp(at, _zone(time_zone))
+    return moment.hour * 60 + moment.minute
+
+
 class RelayClient:
     """Send only to the configured HTTPS relay; never follow redirects."""
 
@@ -170,11 +180,17 @@ class RelayClient:
         self.base_url = base_url.rstrip("/")
 
     def send(self, installation_id, secret, event):
+        return self._post(installation_id, secret, "/events", event)
+
+    def send_activity(self, installation_id, secret, activity):
+        return self._post(installation_id, secret, "/activity", activity)
+
+    def _post(self, installation_id, secret, route, payload):
         if not registrations.valid_id(installation_id):
             raise ValueError("invalid installation ID")
         request = urllib.request.Request(
-            self.base_url + "/v1/installations/" + installation_id + "/events",
-            data=json.dumps(event, separators=(",", ":")).encode(),
+            self.base_url + "/v1/installations/" + installation_id + route,
+            data=json.dumps(payload, separators=(",", ":")).encode(),
             headers={"Content-Type": "application/json",
                      "Authorization": "Bearer " + secret},
             method="POST")
@@ -253,6 +269,7 @@ class Dispatcher:
                 self._evaluate_frame(ts, digest, summary, now)
                 cursor = (ts, digest)
         self.drain()
+        self.drain_activities()
         return True
 
     def _evaluate_frame(self, ts, digest, summary, now):
@@ -268,10 +285,15 @@ class Dispatcher:
                 return
             if snapshot:
                 installations = conn.execute("""SELECT installation_id,rules_json,
-                    service_json,plus,memory_json,time_zone FROM push_installations""").fetchall()
+                    service_json,plus,memory_json,time_zone,activity_json,activity_memory_json
+                    FROM push_installations""").fetchall()
                 for (installation_id, rules_json, service_json, plus, memory_json,
-                     time_zone) in installations:
+                     time_zone, activity_json, activity_memory_json) in installations:
                     rules = json.loads(rules_json)["rules"]
+                    if activity_json:
+                        self._plan_activity(conn, installation_id, rules,
+                                            json.loads(activity_memory_json or "{}"), snapshot,
+                                            ts, digest, now, time_zone)
                     if not rules:
                         continue
                     memory = json.loads(memory_json) if memory_json else {}
@@ -294,6 +316,87 @@ class Dispatcher:
                             ts, ts + EVENT_TTL, now))
             conn.execute("""UPDATE push_dispatcher_state SET cursor_ts=?,cursor_digest=?
                 WHERE singleton=1""", (ts, digest))
+
+    def _plan_activity(self, conn, installation_id, rules, memory, snapshot, ts, digest, now,
+                       time_zone):
+        """Queue the charging Live Activity's next state for one phone, if it has one.
+
+        Free on the phone, so it is not gated on Plus the way alerts are. Latest wins: an update
+        over a start that has not gone yet stays a start, carrying the newer content. Nothing
+        identifies the car: the relay never receives its model, plate or VIN."""
+        step, content, next_memory = charge_activity.plan(
+            memory, snapshot, ts, charge_activity.target_pct(rules))
+        conn.execute("""UPDATE push_installations SET activity_memory_json=?
+            WHERE installation_id=?""", (json.dumps(next_memory), installation_id))
+        if step is None:
+            return
+        minute = None
+        if step == "start" and content["finish_at"] is not None:
+            minute = _minute_of_day(content["finish_at"], time_zone)
+        waiting = conn.execute("""SELECT event,state,alert_minute
+            FROM push_activity_outbox WHERE installation_id=?""", (installation_id,)).fetchone()
+        if step == "update" and waiting and waiting[0] == "start" and waiting[1] == "pending":
+            step, minute = "start", waiting[2]
+        event_id = "a_" + hashlib.sha256(
+            (installation_id + ":" + str(ts) + ":" + digest + ":" + step).encode()).hexdigest()[:40]
+        conn.execute("""INSERT OR REPLACE INTO push_activity_outbox
+            (installation_id,event_id,event,content_json,alert_minute,occurred_at,expires_at,
+             next_attempt) VALUES (?,?,?,?,?,?,?,?)""",
+            (installation_id, event_id, step, json.dumps(content), minute, ts,
+             ts + ACTIVITY_TTL, now))
+
+    def drain_activities(self, limit=20):
+        for _ in range(limit):
+            now = int(self.now())
+            if not self._lease(now):
+                return
+            with closing(_connection(self.push_db)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("""SELECT o.installation_id,o.event_id,o.event,o.content_json,
+                    o.alert_minute,o.occurred_at,o.expires_at,o.attempts,
+                    i.sender_secret FROM push_activity_outbox o JOIN push_installations i
+                    ON i.installation_id=o.installation_id
+                    WHERE o.state IN ('pending','sending') AND o.next_attempt<=?
+                    ORDER BY o.next_attempt LIMIT 1""", (now,)).fetchone()
+                if not row:
+                    break
+                (installation_id, event_id, event, content_json, minute, occurred, expiry,
+                 attempts, secret) = row
+                if expiry <= now or attempts >= 5:
+                    conn.execute("""UPDATE push_activity_outbox SET state='expired'
+                        WHERE installation_id=? AND event_id=?""", (installation_id, event_id))
+                    continue
+                conn.execute("""UPDATE push_activity_outbox SET state='sending',
+                    attempts=attempts+1,next_attempt=? WHERE installation_id=? AND event_id=?""",
+                    (now + 30, installation_id, event_id))
+            activity = {"event_id": event_id, "event": event,
+                        "content": json.loads(content_json), "occurred_at": occurred}
+            if minute is not None:
+                activity["alert_minute"] = minute
+            try:
+                code = self.relay.send_activity(installation_id, secret, activity)
+            except (OSError, TimeoutError, urllib.error.URLError):
+                code = 503
+            with closing(_connection(self.push_db)) as conn, conn:
+                # Keyed on the event as well: a newer state may have replaced this one mid-send.
+                key = (installation_id, event_id)
+                if code == 202:
+                    conn.execute("""UPDATE push_activity_outbox SET state='sent'
+                        WHERE installation_id=? AND event_id=?""", key)
+                elif code in (401, 404):
+                    conn.execute("DELETE FROM push_installations WHERE installation_id=?",
+                                 (installation_id,))
+                    conn.execute("DELETE FROM push_outbox WHERE installation_id=?",
+                                 (installation_id,))
+                    conn.execute("DELETE FROM push_activity_outbox WHERE installation_id=?",
+                                 (installation_id,))
+                elif code in (400, 410):
+                    conn.execute("""UPDATE push_activity_outbox SET state='rejected'
+                        WHERE installation_id=? AND event_id=?""", key)
+                else:
+                    delay = min(15 * (2 ** attempts), 120)
+                    conn.execute("""UPDATE push_activity_outbox SET state='pending',next_attempt=?
+                        WHERE installation_id=? AND event_id=?""", (now + delay, *key))
 
     def drain(self, limit=20):
         for _ in range(limit):
@@ -334,6 +437,8 @@ class Dispatcher:
                     conn.execute("DELETE FROM push_installations WHERE installation_id=?",
                                  (installation_id,))
                     conn.execute("DELETE FROM push_outbox WHERE installation_id=?",
+                                 (installation_id,))
+                    conn.execute("DELETE FROM push_activity_outbox WHERE installation_id=?",
                                  (installation_id,))
                 elif code in (400, 410):
                     conn.execute("UPDATE push_outbox SET state='rejected' WHERE event_id=?",

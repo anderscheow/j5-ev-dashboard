@@ -30,12 +30,19 @@ def valid_id(installation_id):
     return isinstance(installation_id, str) and bool(_ID.fullmatch(installation_id))
 
 
+FIELDS = frozenset(("sender_secret", "rules", "locale", "service", "plus", "time_zone"))
+
+
 def validate(installation_id, body):
     """Return a small canonical binding or raise ValueError before any write."""
     if not valid_id(installation_id):
         raise ValueError("invalid installation ID")
-    if not isinstance(body, dict) or set(body) != {"sender_secret", "rules", "locale", "service", "plus", "time_zone"}:
+    # charge_activity is optional and named only once /api/status lists push_charge_activity:
+    # true asks the dispatcher to keep the phone's charging Live Activity current.
+    if not isinstance(body, dict) or set(body) - {"charge_activity"} != FIELDS:
         raise ValueError("invalid binding fields")
+    if body.get("charge_activity", True) is not True:
+        raise ValueError("invalid charge activity")
     time_zone = body["time_zone"]
     if (not isinstance(time_zone, str) or len(time_zone) > 64 or
             not re.fullmatch(r"[A-Za-z0-9_+\-/]+", time_zone)):
@@ -83,7 +90,7 @@ def validate(installation_id, body):
             date.fromisoformat(last_date)
         except ValueError as e:
             raise ValueError("invalid service date") from e
-    return {"installation_id": installation_id, **body}
+    return {"installation_id": installation_id, "charge_activity": False, **body}
 
 
 def _restrict(path, create=False):
@@ -126,6 +133,11 @@ def _connect(db):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(push_installations)")}
     if "time_zone" not in columns:
         conn.execute("ALTER TABLE push_installations ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC'")
+    # The charging Live Activity: the phone's setting (NULL = not driven from here) and what the
+    # activity was last sent, which the planner diffs the next frame against.
+    for column in ("activity_json", "activity_memory_json"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE push_installations ADD COLUMN {column} TEXT")
     conn.execute("""CREATE TABLE IF NOT EXISTS push_dispatcher_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         cursor_ts INTEGER NOT NULL DEFAULT 0,
@@ -148,6 +160,19 @@ def _connect(db):
     )""")
     conn.execute("""CREATE INDEX IF NOT EXISTS push_outbox_due
         ON push_outbox(state, next_attempt)""")
+    # One waiting Live Activity state per phone: only the newest is worth sending.
+    conn.execute("""CREATE TABLE IF NOT EXISTS push_activity_outbox (
+        installation_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        content_json TEXT NOT NULL,
+        alert_minute INTEGER,
+        occurred_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt INTEGER NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending'
+    )""")
     conn.commit()
     return conn
 
@@ -155,8 +180,9 @@ def _connect(db):
 def put(db, binding):
     with closing(_connect(db)) as conn, conn:
         conn.execute("""INSERT INTO push_installations
-            (installation_id, sender_secret, rules_json, locale, time_zone, service_json, plus, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (installation_id, sender_secret, rules_json, locale, time_zone, service_json, plus,
+             activity_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(installation_id) DO UPDATE SET
               sender_secret=excluded.sender_secret,
               rules_json=excluded.rules_json,
@@ -164,16 +190,23 @@ def put(db, binding):
               time_zone=excluded.time_zone,
               service_json=excluded.service_json,
               plus=excluded.plus,
+              activity_json=excluded.activity_json,
               memory_json=CASE WHEN sender_secret<>excluded.sender_secret
                 THEN NULL ELSE memory_json END,
+              activity_memory_json=CASE WHEN sender_secret<>excluded.sender_secret
+                OR excluded.activity_json IS NULL THEN NULL ELSE activity_memory_json END,
               updated_at=excluded.updated_at""", (
             binding["installation_id"], binding["sender_secret"],
             json.dumps(binding["rules"], sort_keys=True), binding["locale"], binding["time_zone"],
-            json.dumps(binding["service"], sort_keys=True), int(binding["plus"]), int(time.time()),
+            json.dumps(binding["service"], sort_keys=True), int(binding["plus"]),
+            "true" if binding["charge_activity"] else None, int(time.time()),
         ))
         # A queued event from an older rule set or car must not outlive a PUT.
         conn.execute("""DELETE FROM push_outbox WHERE installation_id=?
             AND state IN ('pending','sending')""", (binding["installation_id"],))
+        if not binding["charge_activity"]:
+            conn.execute("DELETE FROM push_activity_outbox WHERE installation_id=?",
+                         (binding["installation_id"],))
 
 
 def delete(db, installation_id):
@@ -181,6 +214,7 @@ def delete(db, installation_id):
         removed = conn.execute("DELETE FROM push_installations WHERE installation_id=?",
                                (installation_id,)).rowcount > 0
         conn.execute("DELETE FROM push_outbox WHERE installation_id=?", (installation_id,))
+        conn.execute("DELETE FROM push_activity_outbox WHERE installation_id=?", (installation_id,))
         return removed
 
 

@@ -63,9 +63,10 @@ def push_enabled():
     import push_dispatcher
     return push_dispatcher.healthy(PUSH_DB)
 
-# Push alert kinds added after push_alerts shipped, each advertised alongside it. A phone names
+# Push alert kinds added after push_alerts shipped, each advertised alongside it, and
+# push_charge_activity: the dispatcher drives the phone's charging Live Activity. A phone names
 # one in its binding only when this dashboard lists it, because an older one refuses the binding.
-PUSH_CAPABILITIES = ("push_alerts", "push_charge_started")
+PUSH_CAPABILITIES = ("push_alerts", "push_charge_started", "push_charge_activity")
 
 def status_capabilities():
     return (["maintenance_guide", "service_centres", "maintenance_records"] if DEMO else
@@ -1284,15 +1285,27 @@ def alert_summary(data, now, tyre_frame=None):
     ts, dt, dec = data[-1]
     fr = [(t, d.get("battery"), d.get("odometer")) for t, _, d in data
           if d.get("battery") is not None and d.get("odometer") is not None]
+    # The charge rate as summary() reports it: the SoC session's, then the car's own when it
+    # flags a charge -- the charging Live Activity shows it.
+    live = _live_soc_session(data, build_sessions(fr, now))
+    rate = None
+    if live:
+        lr = live_rate(live["pts"])
+        rate = round(lr if lr is not None else live["avg"], 1)
+    if _car_charging(dec):
+        rate = dec["charge_power"]
     out = {"vehicle": _vehicle(), "updated": dt, "battery": dec.get("battery"),
            "odometer": dec.get("odometer"), "volt12": dec.get("volt12"),
            "unlocked": dec.get("unlocked"), "doors": dec.get("doors"),
            "trunk_open": dec.get("trunk_open"), "windows": dec.get("windows"),
            "sunroof_open": dec.get("sunroof_open"), "moving": _moving(data, now),
-           "charging": {"active": _car_charging(dec) or
-                        _live_soc_session(data, build_sessions(fr, now)) is not None,
+           "charging": {"active": _car_charging(dec) or live is not None,
                         "remaining_min": dec.get("charge_remain"),
-                        "elapsed_min": _charge_elapsed_min(data)},
+                        "elapsed_min": _charge_elapsed_min(data),
+                        # For the charging Live Activity the dispatcher keeps current.
+                        "rate_kw": rate,
+                        "mode": {16: "dc", 1: "ac"}.get(dec.get("charge_mode")),
+                        "state": dec.get("charge_state")},
            "tyre_unit": TYRE_UNIT, "tyre_status": "Normal", "tyre_indirect": True,
            "tpms": [{"pos": p, "psi": None, "temp": None, "valid": False} for p in TPMS_POS],
            "volt12_status": None}
