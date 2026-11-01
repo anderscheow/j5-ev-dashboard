@@ -383,14 +383,17 @@ class Dispatcher:
                 if code == 202:
                     conn.execute("""UPDATE push_activity_outbox SET state='sent'
                         WHERE installation_id=? AND event_id=?""", key)
-                elif code in (401, 404):
+                elif code == 401:
+                    # The relay no longer knows this phone. Only 401 says so here: a 404 is
+                    # also what a relay older than the activity route answers, and that must
+                    # not cost the phone its alerts.
                     conn.execute("DELETE FROM push_installations WHERE installation_id=?",
                                  (installation_id,))
                     conn.execute("DELETE FROM push_outbox WHERE installation_id=?",
                                  (installation_id,))
                     conn.execute("DELETE FROM push_activity_outbox WHERE installation_id=?",
                                  (installation_id,))
-                elif code in (400, 410):
+                elif code in (400, 404, 410):
                     conn.execute("""UPDATE push_activity_outbox SET state='rejected'
                         WHERE installation_id=? AND event_id=?""", key)
                 else:

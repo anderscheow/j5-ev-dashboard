@@ -508,6 +508,16 @@ class DispatcherTest(unittest.TestCase):
         last = self.activities()[-1]
         self.assertEqual((last["event"], last["content"]["soc"]), ("start", 26))
 
+    def test_a_relay_without_the_activity_route_does_not_cost_the_binding(self):
+        registrations.put(self.push, binding("installation_1234567890", charge_activity=True))
+        self.row(self.now - 20, "aaa", battery=22)
+        self.worker.run_once()
+        self.relay.statuses = [404]
+        self.latest["charging"] = {"active": True, "elapsed_min": 1, "remaining_min": 351}
+        self.row(self.now - 10, "bbb", battery=22)
+        self.worker.run_once()
+        self.assertEqual(registrations.count(self.push), 1)
+
     def test_new_worker_takes_over_after_lease_expires(self):
         self.row(self.now - 10, "aaa", battery=25)
         self.worker.run_once()
