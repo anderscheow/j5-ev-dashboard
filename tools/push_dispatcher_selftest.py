@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
+import charge_activity as activity
 import push_dispatcher as dispatch
 import push_evaluator as evaluator
 import push_registrations as registrations
@@ -24,10 +25,11 @@ SERVICE = {"last_odo": None, "last_date": None,
            "interval_km": None, "interval_months": None}
 
 
-def binding(installation_id, *, rules=RULES, plus=True, service=SERVICE, time_zone="UTC"):
+def binding(installation_id, *, rules=RULES, plus=True, service=SERVICE, time_zone="UTC",
+            **extra):
     return registrations.validate(installation_id, {
         "sender_secret": SECRET, "rules": rules, "locale": "en",
-        "service": service, "plus": plus, "time_zone": time_zone,
+        "service": service, "plus": plus, "time_zone": time_zone, **extra,
     })
 
 
@@ -170,6 +172,37 @@ class AlertParityTest(unittest.TestCase):
         events, _ = evaluator.evaluate(rules, {}, indirect, SERVICE)
         self.assertEqual(events, [])
 
+    def test_parked_and_open_waits_out_the_dwell(self):
+        rules = {"left_unlocked": {"on": True}, "panel_open": {"on": True}}
+        dwell = evaluator.PARKED_DWELL_SEC
+        open_car = snapshot(unlocked=True, doors=1)
+        memory = {"charging": False, "soc": 60}
+        # First sighting starts the wait; nothing fires and nothing latches.
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=1000)
+        self.assertEqual(events, [])
+        self.assertEqual(memory["fired"], [])
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=1000 + dwell - 1)
+        self.assertEqual(events, [])
+        # A shut frame in between is the owner locking up: the wait starts over.
+        _, memory = evaluator.evaluate(rules, memory, snapshot(), SERVICE, ts=1000 + dwell)
+        self.assertNotIn("since", memory)
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000)
+        self.assertEqual(events, [])
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000 + dwell)
+        self.assertEqual({e["kind"] for e in events}, {"left_unlocked", "panel_open"})
+        self.assertNotIn("since", memory)
+        # Latched: silent until it clears.
+        events, _ = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000 + 2 * dwell)
+        self.assertEqual(events, [])
+
+    def test_first_evaluation_does_not_wait(self):
+        # The dispatcher's baseline pass drops these events and keeps the latch, so a car already
+        # open when a phone registers is never announced -- and never waits for a dwell either.
+        rules = {"left_unlocked": {"on": True}}
+        _, memory = evaluator.evaluate(rules, {}, snapshot(unlocked=True), SERVICE, ts=1000)
+        self.assertEqual(memory["fired"], ["left_unlocked"])
+        self.assertNotIn("since", memory)
+
     def test_panel_open_says_what_is_open(self):
         rules = {"panel_open": {"on": True}}
         # Two doors and the sunroof; byte 2's undecoded high bits are no door.
@@ -237,6 +270,55 @@ class FakeRelay:
         if hook:
             hook()
         return self.statuses.pop(0) if self.statuses else 202
+
+    def send_activity(self, installation_id, secret, payload):
+        self.sent.append((installation_id, secret, {"activity": payload}))
+        return self.statuses.pop(0) if self.statuses else 202
+
+
+class ChargeActivityPlanTest(unittest.TestCase):
+    """The Python mirror of planChargeActivity, on the 2026-10-28 charge."""
+
+    def charging(self, **changes):
+        return snapshot(**{"charging": True, "battery": 22, "charge_elapsed_min": 1,
+                           "charge_remaining_min": 351, "charge_rate_kw": 2.8,
+                           "charge_mode": "ac", "charge_state": 1, **changes})
+
+    def test_a_charge_starts_estimating_then_quotes_the_settled_finish(self):
+        step, content, memory = activity.plan({}, self.charging(), 1000, 80)
+        self.assertEqual(step, "start")
+        self.assertEqual(content, {"phase": "charging", "soc": 22, "updated_at": 1000,
+                                   "target_pct": 80, "rate_kw": 2.8, "mode": "ac",
+                                   "finish_at": None, "estimating": True})
+        # Too soon after the last push, even though the estimate settled.
+        settled = self.charging(charge_elapsed_min=5, charge_remaining_min=141)
+        self.assertIsNone(activity.plan(memory, settled, 1060, 80)[0])
+        step, content, memory = activity.plan(memory, settled, 1000 + activity.UPDATE_GAP, 80)
+        self.assertEqual(step, "update")
+        self.assertEqual(content["finish_at"], 1000 + activity.UPDATE_GAP + 141 * 60)
+        self.assertFalse(content["estimating"])
+        # Nothing on screen would move: no push.
+        same = self.charging(charge_elapsed_min=6, charge_remaining_min=140)
+        self.assertIsNone(activity.plan(memory, same, 1000 + 2 * activity.UPDATE_GAP, 80)[0])
+
+    def test_the_end_reads_complete_or_stopped_like_the_alerts(self):
+        _, _, memory = activity.plan({}, self.charging(), 1000, 80)
+        done = snapshot(battery=80, charge_state=2)
+        step, content, memory = activity.plan(memory, done, 2000, 80)
+        self.assertEqual((step, content["phase"], content["rate_kw"]), ("end", "complete", None))
+        self.assertIsNone(activity.plan(memory, done, 3000, 80)[0])
+        _, _, memory = activity.plan({}, self.charging(), 1000, None)
+        step, content, _ = activity.plan(memory, snapshot(battery=61), 2000, None)
+        self.assertEqual((step, content["phase"]), ("end", "stopped"))
+
+    def test_nothing_happens_without_a_charge(self):
+        self.assertEqual(activity.plan({}, snapshot(), 1000, 80), (None, None, {}))
+
+    def test_the_tick_is_the_charge_target_only_while_that_rule_is_on(self):
+        self.assertIsNone(activity.target_pct({}))
+        self.assertIsNone(activity.target_pct({"charge_complete": {"on": False, "t": 90}}))
+        self.assertEqual(activity.target_pct({"charge_complete": {"on": True, "t": 90}}), 90)
+        self.assertEqual(activity.target_pct({"charge_complete": {"on": True}}), 80)
 
 
 class DispatcherTest(unittest.TestCase):
@@ -362,6 +444,79 @@ class DispatcherTest(unittest.TestCase):
             "Asia/Kuala_Lumpur"))
         self.assertEqual((sent["kind"], sent["value"]),
                          ("charge_started", finish.hour * 60 + finish.minute))
+
+    def activities(self):
+        return [sent[2]["activity"] for sent in self.relay.sent if "activity" in sent[2]]
+
+    def test_the_live_activity_follows_the_charge_with_the_app_closed(self):
+        registrations.put(self.push, binding("installation_1234567890",
+                                             charge_activity=True,
+                                             time_zone="Asia/Kuala_Lumpur"))
+        self.row(self.now - 20, "aaa", battery=22)
+        self.worker.run_once()
+        self.assertEqual(self.activities(), [])
+        self.latest["charging"] = {"active": True, "elapsed_min": 1, "remaining_min": 351,
+                                   "rate_kw": 2.8, "mode": "ac", "state": 1}
+        self.row(self.now - 10, "bbb", battery=22)
+        self.worker.run_once()
+        start = self.activities()[-1]
+        self.assertEqual(start["event"], "start")
+        self.assertNotIn("vehicle_label", start)  # nothing that identifies the car
+        self.assertTrue(start["content"]["estimating"])
+        self.assertNotIn("alert_minute", start)  # no settled finish to quote yet
+        self.now += 300
+        self.latest["charging"] = {"active": True, "elapsed_min": 6, "remaining_min": 141,
+                                   "rate_kw": 6.1, "mode": "ac", "state": 1}
+        self.row(self.now - 10, "ccc", battery=25)
+        self.worker.run_once()
+        update = self.activities()[-1]
+        self.assertEqual((update["event"], update["content"]["soc"]), ("update", 25))
+        self.assertEqual(update["content"]["finish_at"], self.now - 10 + 141 * 60)
+        self.now += 60
+        self.latest["charging"] = {"active": False, "state": 2}
+        self.row(self.now - 10, "ddd", battery=80)
+        self.worker.run_once()
+        end = self.activities()[-1]
+        self.assertEqual((end["event"], end["content"]["phase"]), ("end", "complete"))
+        self.assertEqual(len(self.activities()), 3)
+
+    def test_no_activity_without_the_setting(self):
+        registrations.put(self.push, binding("installation_1234567890"))
+        registrations.put(self.push, binding("installation_0987654321",
+                                             charge_activity=True))
+        self.row(self.now - 20, "aaa", battery=22)
+        self.worker.run_once()
+        self.latest["charging"] = {"active": True, "elapsed_min": 1, "remaining_min": 351}
+        self.row(self.now - 10, "bbb", battery=22)
+        self.worker.run_once()
+        sent = [s for s in self.relay.sent if "activity" in s[2]]
+        self.assertEqual([s[0] for s in sent], ["installation_0987654321"])
+
+    def test_a_retried_start_keeps_its_place_ahead_of_newer_states(self):
+        registrations.put(self.push, binding("installation_1234567890",
+                                             charge_activity=True))
+        self.relay.statuses = [503]
+        self.row(self.now - 30, "aaa", battery=22)
+        self.worker.run_once()
+        self.latest["charging"] = {"active": True, "elapsed_min": 1, "remaining_min": 351}
+        self.row(self.now - 20, "bbb", battery=22)
+        self.worker.run_once()  # the start fails once
+        self.now += 150
+        self.latest["charging"] = {"active": True, "elapsed_min": 6, "remaining_min": 141}
+        self.row(self.now - 10, "ccc", battery=26)
+        self.worker.run_once()
+        last = self.activities()[-1]
+        self.assertEqual((last["event"], last["content"]["soc"]), ("start", 26))
+
+    def test_a_relay_without_the_activity_route_does_not_cost_the_binding(self):
+        registrations.put(self.push, binding("installation_1234567890", charge_activity=True))
+        self.row(self.now - 20, "aaa", battery=22)
+        self.worker.run_once()
+        self.relay.statuses = [404]
+        self.latest["charging"] = {"active": True, "elapsed_min": 1, "remaining_min": 351}
+        self.row(self.now - 10, "bbb", battery=22)
+        self.worker.run_once()
+        self.assertEqual(registrations.count(self.push), 1)
 
     def test_new_worker_takes_over_after_lease_expires(self):
         self.row(self.now - 10, "aaa", battery=25)

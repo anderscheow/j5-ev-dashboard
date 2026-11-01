@@ -168,6 +168,7 @@ account settings remain unavailable.
 | `vehicle_alerts` | `GET /api/alertconfig` and `POST /api/alertconfig` read/write the two supported alert switches; `/api/settings` also exposes them. |
 | `push_alerts` | `GET /api/push/status`, `PUT /api/push/installations/{installation_id}`, and `DELETE /api/push/installations/{installation_id}` manage Voltmoss remote-alert bindings. Advertised only when the dashboard is configured, password-gated, and explicitly configured for a HTTPS relay and HTTPS public access. This is separate from CarLinko's `vehicle_alerts`. |
 | `push_charge_started` | The push binding accepts and the dispatcher evaluates the `charge_started` rule. Advertised exactly when `push_alerts` is: the kind arrived after the binding contract shipped, and a dashboard without it answers 400 to a binding that names it, so a phone names it only when this is listed. |
+| `push_charge_activity` | The push binding accepts the optional `charge_activity` field and the dispatcher keeps the phone's charging Live Activity current through the relay. Advertised exactly when `push_alerts` is; a dashboard without it answers 400 to a binding that names the field. |
 | `climate_settings` | `POST /api/actemp` sets a supported A/C temperature and `POST /api/airduration` sets 5, 10 or 15 minutes; current duration reads back through `/api/controls`. |
 | `climate_seats` | `POST /api/seat` applies a supported seat heat/vent level after checking the car's capabilities. |
 | `maintenance_guide` | `GET /api/maintenance-guide` returns the country and model timetable, completed milestones, and next due service. |
@@ -268,6 +269,25 @@ service reminder counts days to the due date on the phone's calendar, so the
 dispatcher evaluates it in that zone rather than the dashboard's; a Railway
 container runs on UTC and would otherwise move the reminder by a day near
 midnight. All six fields are required.
+
+`charge_activity` is a seventh, optional field, sent only when `/api/status`
+lists `push_charge_activity`: `true`, and nothing else is accepted. While it is
+present the dispatcher plans the phone's charging
+Live Activity from every fresh frame -- start when a charge begins, an update
+when the battery, the finish estimate, the rate or the connector changes (at
+most one every two minutes, at least one every ten), and an end with the
+outcome (`complete` when the car says so or the battery reached the
+charge-target rule's threshold, `stopped` otherwise). It posts the activity's
+content to the relay's `POST /v1/installations/{id}/activity`; the shape is the
+app's `ChargeActivityContent.toJson` (`phase`, `soc`, `updated_at`,
+`target_pct`, `rate_kw`, `mode`, `finish_at`, `estimating`) and nothing that
+identifies the car -- no model, plate or VIN reaches the relay; a start adds
+only the settled finish as minutes past midnight on the phone's clock
+(`alert_minute`) for its banner. `finish_at` appears only once the car's
+estimate has settled (`elapsed_min` ≥ 5). The activity is not gated on `plus`:
+it is free on the phone. Omitting the field stops it and forgets what was
+shown. `tools/charge_activity.py` mirrors the app's planner and
+`push_dispatcher_selftest.py` pins it.
 
 The dispatcher judges each fresh frame from the frame itself plus the seven
 days before it (the 12V watch's span; no charge still in progress started

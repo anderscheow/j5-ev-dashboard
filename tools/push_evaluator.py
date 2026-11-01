@@ -18,6 +18,12 @@ CHARGE_SETTLE_MIN = 5
 # the moment a charge started.
 CHARGE_RECENT_MIN = 60
 
+# left_unlocked and panel_open describe a car that is parked and open, which is also how a car looks
+# for the minute it takes to get out, fetch something and lock it. They speak only once the condition
+# has held, frame after frame, for this long; any frame where it clears starts the wait again.
+# Mirrors DwellConfig in lib/core/utils/alert_evaluator.dart, AlertEvaluator.swift and AlertEvaluator.kt.
+PARKED_DWELL_SEC = 120
+
 
 def _threshold(rules, kind):
     entry = rules.get(kind) or {}
@@ -94,16 +100,28 @@ def _open_panels(snapshot):
             (PANEL_WINDOW if snapshot.get("windows_open") is True else 0))
 
 
-def evaluate(rules, memory, snapshot, service, today=None):
-    """Return (events, next memory); events are {kind, value} dictionaries."""
+def evaluate(rules, memory, snapshot, service, today=None, ts=None):
+    """Return (events, next memory); events are {kind, value} dictionaries.
+
+    ts is the frame's time. Without it a dwell condition latches at once, as before."""
     today = today or date.today()
     events = []
     fired = set()
     previous_fired = set(memory.get("fired") or ())
+    previous_since = memory.get("since") or {}
+    since = {}
+    # A first evaluation latches silently, as for every level condition: there is nothing to wait on.
+    first = "charging" not in memory
     charging = snapshot["charging"]
     battery = snapshot["battery"]
 
-    def level(kind, active, value=None, raise_event=True):
+    def level(kind, active, value=None, raise_event=True, dwell=0):
+        if active and dwell and ts is not None and not first and kind not in previous_fired:
+            began = previous_since.get(kind)
+            began = ts if type(began) is not int or began > ts else began
+            if ts - began < dwell:
+                since[kind] = began
+                return  # not latched yet: nothing fires, and nothing is remembered as seen
         if active:
             fired.add(kind)
             if raise_event and _on(rules, kind) and kind not in previous_fired:
@@ -130,9 +148,9 @@ def evaluate(rules, memory, snapshot, service, today=None):
 
     level("soc_below", not charging and battery < _threshold(rules, "soc_below"), battery)
     parked = not snapshot.get("moving", False)
-    level("left_unlocked", parked and snapshot.get("unlocked") is True)
+    level("left_unlocked", parked and snapshot.get("unlocked") is True, dwell=PARKED_DWELL_SEC)
     panels = _open_panels(snapshot)
-    level("panel_open", parked and panels != 0, panels)
+    level("panel_open", parked and panels != 0, panels, dwell=PARKED_DWELL_SEC)
     level("tyre_pressure", _tyre_problem(snapshot))
     # A low status can arrive without a usable reading (0 V is the decoder's "absent"). The
     # event still goes out, with no number, and the relay picks the copy that quotes none.
@@ -142,4 +160,4 @@ def evaluate(rules, memory, snapshot, service, today=None):
     level("service_due", _service_due(service, snapshot.get("odometer"), today))
     # The relay's service copy has no numeric placeholder; Dart carries kmRemaining.
     return events, {"v": 2, "charging": charging, "soc": battery,
-                    "fired": sorted(fired)}
+                    "fired": sorted(fired), **({"since": since} if since else {})}

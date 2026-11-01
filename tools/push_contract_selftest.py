@@ -33,6 +33,30 @@ BODY = {
 }
 
 
+class ChargeActivityBindingTest(unittest.TestCase):
+    """charge_activity is optional, so every binding written before it still validates."""
+
+    def test_the_field_is_optional_and_strict(self):
+        self.assertFalse(push.validate(INSTALLATION, BODY)["charge_activity"])
+        on = push.validate(INSTALLATION, {**BODY, "charge_activity": True})
+        self.assertTrue(on["charge_activity"])
+        for bad in (False, None, 1, {"label": True}, "true"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                push.validate(INSTALLATION, {**BODY, "charge_activity": bad})
+
+    def test_switching_it_off_forgets_what_was_shown(self):
+        with tempfile.TemporaryDirectory() as data:
+            db = os.path.join(data, "push.db")
+            push.put(db, push.validate(INSTALLATION, {**BODY, "charge_activity": True}))
+            with push._connect(db) as conn:
+                conn.execute("UPDATE push_installations SET activity_memory_json='{}'")
+            push.put(db, push.validate(INSTALLATION, BODY))
+            with push._connect(db) as conn:
+                row = conn.execute("""SELECT activity_json,activity_memory_json
+                    FROM push_installations""").fetchone()
+            self.assertEqual(row, (None, None))
+
+
 class PushContractTest(unittest.TestCase):
     def setUp(self):
         self.data = tempfile.TemporaryDirectory()
@@ -103,6 +127,7 @@ class PushContractTest(unittest.TestCase):
         # Advertised with push_alerts and never without it: a phone names charge_started in its
         # binding only when the dashboard lists the capability.
         self.assertIn("push_charge_started", status["capabilities"])
+        self.assertIn("push_charge_activity", status["capabilities"])
         self.assertEqual(status["api_version"], server.API_VERSION)
         self.assertEqual(self.request("PUT", "/api/push/installations/" + INSTALLATION, BODY)[0], 401)
         self.assertEqual(self.request("PUT", "/api/push/installations/" + INSTALLATION, BODY, cookie)[0], 200)
@@ -115,6 +140,7 @@ class PushContractTest(unittest.TestCase):
             capabilities = self.request("GET", "/api/status")[1]["capabilities"]
             self.assertNotIn("push_alerts", capabilities)
             self.assertNotIn("push_charge_started", capabilities)
+            self.assertNotIn("push_charge_activity", capabilities)
             self.assertEqual(self.request("GET", "/api/push/status", cookie=cookie)[1],
                              {"enabled": False, "registered_count": 1})
             self.assertEqual(self.request("DELETE", path, cookie=cookie)[0], 200)
