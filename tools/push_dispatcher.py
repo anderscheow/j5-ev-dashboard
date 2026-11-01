@@ -277,7 +277,7 @@ class Dispatcher:
                     memory = json.loads(memory_json) if memory_json else {}
                     events, next_memory = push_evaluator.evaluate(
                         rules, memory, snapshot, json.loads(service_json),
-                        today=_local_date(ts, time_zone))
+                        today=_local_date(ts, time_zone), ts=ts)
                     conn.execute("""UPDATE push_installations SET memory_json=?
                         WHERE installation_id=?""", (json.dumps(next_memory), installation_id))
                     if not plus or not memory_json:

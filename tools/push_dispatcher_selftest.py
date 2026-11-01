@@ -170,6 +170,35 @@ class AlertParityTest(unittest.TestCase):
         events, _ = evaluator.evaluate(rules, {}, indirect, SERVICE)
         self.assertEqual(events, [])
 
+    def test_parked_and_open_waits_out_the_dwell(self):
+        rules = {"left_unlocked": {"on": True}, "panel_open": {"on": True}}
+        dwell = evaluator.PARKED_DWELL_SEC
+        open_car = snapshot(unlocked=True, doors=1)
+        memory = {"charging": False, "soc": 60}
+        # First sighting starts the wait; nothing fires and nothing latches.
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=1000)
+        self.assertEqual(events, [])
+        self.assertEqual(memory["fired"], [])
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=1000 + dwell - 1)
+        self.assertEqual(events, [])
+        # A shut frame in between is the owner locking up: the wait starts over.
+        _, memory = evaluator.evaluate(rules, memory, snapshot(), SERVICE, ts=1000 + dwell)
+        self.assertNotIn("since", memory)
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000)
+        self.assertEqual(events, [])
+        events, memory = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000 + dwell)
+        self.assertEqual({e["kind"] for e in events}, {"left_unlocked", "panel_open"})
+        self.assertNotIn("since", memory)
+        # Latched: silent until it clears.
+        events, _ = evaluator.evaluate(rules, memory, open_car, SERVICE, ts=2000 + 2 * dwell)
+        self.assertEqual(events, [])
+
+    def test_first_evaluation_latches_a_dwell_condition_silently(self):
+        rules = {"left_unlocked": {"on": True}}
+        events, memory = evaluator.evaluate(rules, {}, snapshot(unlocked=True), SERVICE, ts=1000)
+        self.assertEqual(events, [])
+        self.assertEqual(memory["fired"], ["left_unlocked"])
+
     def test_panel_open_says_what_is_open(self):
         rules = {"panel_open": {"on": True}}
         # Two doors and the sunroof; byte 2's undecoded high bits are no door.
