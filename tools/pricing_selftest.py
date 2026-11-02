@@ -110,7 +110,10 @@ class RatesTest(unittest.TestCase):
                                {"start": "2026-08-01", "price": 15950}], kml=13)
         self.assertEqual(book.fuel_rate("2026-07-31"), (16250, "period"))
         self.assertEqual(book.fuel_rate("2026-08-01"), (15950, "period"))
-        self.assertEqual(book.fuel_rate("2026-01-01"), (16250, "default"))
+        # the earliest price also covers the days before it, never creds.json's
+        self.assertEqual(self.book(fuel=[{"start": "2026-06-10", "price": 9000}]).fuel_rate(
+            "2026-01-01"), (9000, "period"))
+        self.assertEqual(self.book().fuel_rate("2026-01-01"), (16250, "default"))
         self.assertEqual(book.kml, 13.0)
         self.assertEqual(self.book().kml, 12.0)
 
@@ -162,7 +165,10 @@ class RatesTest(unittest.TestCase):
                   (t0 + 3 * 86400, 1100), (t0 + 3 * 86400 + 3600, 1150)]
         self.assertAlmostEqual(self.book().fuel_cost(points), 150 * 16250 / 12)
         book = self.book(fuel=[{"start": "2026-08-01", "price": 12000}])
-        self.assertAlmostEqual(book.fuel_cost(points), 100 * 16250 / 12 + 50 * 12000 / 12)
+        self.assertAlmostEqual(book.fuel_cost(points), 150 * 12000 / 12)   # earliest backfills
+        book = self.book(fuel=[{"start": "2026-07-01", "price": 15000},
+                               {"start": "2026-08-01", "price": 12000}])
+        self.assertAlmostEqual(book.fuel_cost(points), 100 * 15000 / 12 + 50 * 12000 / 12)
 
 
 class StorageTest(unittest.TestCase):

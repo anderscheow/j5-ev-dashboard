@@ -302,8 +302,12 @@ class PriceBook:
         return (period["price"], "period", period) if period else (self.tariff, "default", None)
 
     def fuel_rate(self, day):
-        """(price per litre, 'period' or 'default') on `day`."""
-        period = self._at(self._fuel, day)
+        """(price per litre, 'period' or 'default') on `day`. The earliest fuel period also
+        covers the days before it: every km needs a petrol price, and creds.json's -- 16250 in
+        any currency unless someone set it, which the clients' own comparison never asked
+        anyone to -- was never the owner's. A charging tariff, by contrast, is one owners did
+        configure, so charge sessions before the first period keep it."""
+        period = self._at(self._fuel, day) or (self._fuel[1][0] if self._fuel[1] else None)
         return (period["price"], "period") if period else (self.fuel_default, "default")
 
     def _claims(self, sessions):

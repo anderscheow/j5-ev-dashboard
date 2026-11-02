@@ -252,6 +252,12 @@ its own type (`ac`/`dc`) that had started by its day; else the newest `all` peri
 12 kW is DC). Billed kWh is the receipt's when an override gave it, else the kWh into the pack
 over the charge efficiency, as before.
 
+**Fuel** has one track, and its earliest price also covers the days before it: `creds.json`'s
+`petrol_price` (16250 in any currency unless someone set it, which neither client ever asked an
+owner to do) prices fuel only while the book has no fuel price at all. One dated fuel price
+therefore reprices the whole history at that price, exactly as the clients' single on-device
+price did.
+
 **Session IDs.** Sessions are not stored; the server re-derives them from telemetry on every
 request. A session's `id` is the unix second it reported the session starting, and an override is
 matched back to the session whose window — from 10 minutes before its start to its last SoC rise
