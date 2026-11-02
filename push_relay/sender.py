@@ -12,7 +12,8 @@ import os
 import time
 from pathlib import Path
 
-from .relay import InvalidInstallation, KINDS, LOCALES
+from . import live_activity
+from .relay import InvalidActivityToken, InvalidInstallation, KINDS, LOCALES
 
 
 COPY_KEYS = {
@@ -156,3 +157,29 @@ class FirebaseSender:
             m.send(message, app=self.app)
         except m.UnregisteredError as e:
             raise InvalidInstallation() from e
+
+    def send_activity(self, row, token):
+        """One ActivityKit push for the charging Live Activity.
+
+        A start carries the charge_started copy as its alert -- iOS shows nothing for a
+        push-to-start without one -- and no sound, so the only buzz stays the charge_started
+        notification itself. Updates go at priority 5, which iOS does not count against the
+        activity's budget; a start or an end goes at once."""
+        m = self.messaging
+        state = {**json.loads(row["content"]), "lang": row["locale"]}
+        now = int(time.time())
+        event = row["event"]
+        dismissal = now + 30 * 60 if event == "end" and state["phase"] == "complete" else None
+        fields = live_activity.aps(event, state, now=now, dismissal_at=dismissal)
+        alert = (self.copy.render(row["locale"], "charge_started", row["alert_minute"])
+                 if event == "start" else None)
+        message = live_activity.message(
+            m, live_activity_token=token, aps_fields=fields, fid=row["fid"], alert=alert,
+            priority=5 if event == "update" else 10)
+        try:
+            m.send(message, app=self.app)
+        except m.UnregisteredError as e:
+            # For a Live Activity push this is APNs refusing the activity token, not FCM
+            # refusing the FID: retiring the installation here would end its alerts too.
+            raise InvalidActivityToken() from e
+

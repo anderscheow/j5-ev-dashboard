@@ -12,8 +12,8 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from .relay import (ApiError, InvalidInstallation, MAX_INSTALLATIONS_PER_FID,
-                    MAX_PER_HOUR, Relay, RelayStore)
+from .relay import (ApiError, InvalidActivityToken, InvalidInstallation,
+                    MAX_INSTALLATIONS_PER_FID, MAX_PER_HOUR, Relay, RelayStore)
 from .sender import AlertCopy, FirebaseSender
 from .server import handler_for
 
@@ -32,6 +32,11 @@ class FakeSender:
         if self.error:
             raise self.error
         self.sent.append(row)
+
+    def send_activity(self, row, token):
+        if self.error:
+            raise self.error
+        self.sent.append({**row, "token": token})
 
 
 class RelayTests(unittest.TestCase):
@@ -221,6 +226,129 @@ class RelayTests(unittest.TestCase):
             self.assertNotIn("{", body)
 
 
+class ActivityTests(unittest.TestCase):
+    """The charging Live Activity: tokens from the phone, states from the dashboard."""
+
+    START, UPDATE = "a" * 64, "b" * 64
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.time = [1_780_000_000]
+        self.sender = FakeSender()
+        self.relay = Relay(RelayStore(str(Path(self.temp.name) / "relay.db")), self.sender,
+                           now=lambda: self.time[0])
+        created = self.relay.create({"fid": FID, "platform": "ios", "locale": "ms"})
+        self.id, self.secret = created["installation_id"], created["sender_secret"]
+
+    def content(self, phase="charging", soc=40, **changes):
+        return {"phase": phase, "soc": soc, "updated_at": self.time[0], "target_pct": 80,
+                "rate_kw": 6.1, "mode": "ac", "finish_at": None, "estimating": True,
+                **changes}
+
+    def post(self, event, n=1, **extra):
+        return self.relay.enqueue_activity(self.id, self.secret, {
+            "event_id": f"activity_{n:016d}", "event": event, "content": self.content(),
+            "occurred_at": self.time[0], **extra})
+
+    def tokens(self, **body):
+        return self.relay.set_activity_tokens(self.id, self.secret, body)
+
+    def test_a_phone_without_the_token_it_needs_is_skipped_not_retried(self):
+        self.post("start")
+        self.assertEqual(self.relay.drain_activities(), 0)
+        self.assertEqual(self.relay.metrics()["activities"], {"skipped": 1})
+        self.tokens(update=self.UPDATE)
+        self.post("start", n=2)  # still no push-to-start token: an update token cannot start
+        self.relay.drain_activities()
+        self.assertEqual(self.sender.sent, [])
+
+    def test_start_uses_push_to_start_and_retires_the_old_update_token(self):
+        self.tokens(push_to_start=self.START, update=self.UPDATE)
+        self.time[0] += 10
+        self.post("start", alert_minute=None)
+        self.assertEqual(self.relay.drain_activities(), 1)
+        sent = self.sender.sent.pop()
+        self.assertEqual((sent["event"], sent["token"], sent["locale"]),
+                         ("start", self.START, "ms"))
+        # The update token addressed the last activity; the new one reports its own.
+        self.post("update", n=2)
+        self.relay.drain_activities()
+        self.assertEqual(self.sender.sent, [])
+        self.tokens(update="c" * 64)
+        self.post("update", n=3)
+        self.relay.drain_activities()
+        self.assertEqual(self.sender.sent.pop()["token"], "c" * 64)
+
+    def test_only_the_newest_state_is_sent_and_an_unsent_start_stays_a_start(self):
+        self.tokens(push_to_start=self.START, update=self.UPDATE)
+        self.post("start", alert_minute=600)
+        self.relay.enqueue_activity(self.id, self.secret, {
+            "event_id": "activity_9999999999999999", "event": "update",
+            "content": self.content(soc=41, estimating=False, finish_at=self.time[0] + 600),
+            "occurred_at": self.time[0]})
+        self.assertEqual(self.relay.drain_activities(), 1)
+        sent = self.sender.sent.pop()
+        self.assertEqual((sent["event"], sent["alert_minute"]), ("start", 600))
+        self.assertEqual(json.loads(sent["content"])["soc"], 41)
+
+    def test_a_refused_token_is_forgotten_and_alerts_are_untouched(self):
+        self.tokens(update=self.UPDATE)
+        self.sender.error = InvalidActivityToken()
+        self.post("update")
+        self.relay.drain_activities()
+        self.sender.error = None
+        self.post("update", n=2)
+        self.relay.drain_activities()
+        self.assertEqual(self.sender.sent, [])
+        # The installation itself survives: its alerts still go out.
+        self.relay.enqueue(self.id, self.secret, {"event_id": "event_123456789012345",
+                                                  "kind": "left_unlocked", "value": None,
+                                                  "occurred_at": self.time[0]})
+        self.assertEqual(self.relay.drain_due(), 1)
+
+    def test_a_failed_send_retries_then_gives_up(self):
+        self.tokens(update=self.UPDATE)
+        self.sender.error = OSError()
+        self.post("update")
+        for _ in range(6):
+            self.relay.drain_activities()
+            self.time[0] += 200
+        self.assertEqual(self.relay.metrics()["activities"], {"expired": 1})
+
+    def test_validation(self):
+        with self.assertRaises(ApiError) as e:
+            self.tokens(push_to_start="not hex")
+        self.assertEqual(e.exception.status, 400)
+        with self.assertRaises(ApiError) as e:
+            self.relay.set_activity_tokens(self.id, "0" * 64, {"update": self.UPDATE})
+        self.assertEqual(e.exception.status, 401)
+        self.tokens(update=None)  # null forgets
+        bad = [{"soc": 101}, {"phase": "warp"}, {"mode": "plug"}, {"rate_kw": float("nan")},
+               {"finish_at": self.time[0] - 1}, {"estimating": 1}, {"extra": 1}]
+        for change in bad:
+            with self.subTest(change=change), self.assertRaises(ApiError) as e:
+                self.relay.enqueue_activity(self.id, self.secret, {
+                    "event_id": "activity_1234567890123456", "event": "update",
+                    "content": self.content(**change), "occurred_at": self.time[0]})
+            self.assertEqual(e.exception.status, 400)
+        for extra in ({"alert_minute": 1440}, {"vehicle_label": "Tiggo 7"}):
+            with self.subTest(extra=extra), self.assertRaises(ApiError) as e:
+                self.post("start", **extra)
+            self.assertEqual(e.exception.status, 400)
+        with self.assertRaises(ApiError) as e:
+            self.relay.enqueue_activity(self.id, self.secret, {
+                "event_id": "activity_1234567890123456", "event": "update",
+                "content": self.content(), "occurred_at": self.time[0] - 3600})
+        self.assertEqual(e.exception.status, 410)
+
+    def test_revoking_drops_the_waiting_state(self):
+        self.tokens(update=self.UPDATE)
+        self.post("update")
+        self.relay.delete(self.id, self.secret)
+        self.assertEqual(self.relay.drain_activities(), 0)
+
+
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -270,6 +398,24 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request("DELETE", f"/v1/installations/{installation_id}",
                                       headers={"Authorization": "Bearer " + binding["sender_secret"]})[0], 401)
 
+    def test_activity_routes_take_the_installation_secret(self):
+        status, binding = self.request("POST", "/v1/installations",
+                                       {"fid": FID, "platform": "ios", "locale": "en"},
+                                       {"X-Firebase-AppCheck": "valid"})
+        base = f"/v1/installations/{binding['installation_id']}"
+        auth = {"Authorization": "Bearer " + binding["sender_secret"]}
+        tokens = {"push_to_start": "a" * 64}
+        self.assertEqual(self.request("PUT", base + "/activity-tokens", tokens)[0], 401)
+        self.assertEqual(self.request("PUT", base + "/activity-tokens", tokens, auth)[0], 200)
+        now = int(time.time())
+        activity = {"event_id": "activity_1234567890123456", "event": "start",
+                    "content": {"phase": "charging", "soc": 30, "updated_at": now,
+                                "target_pct": None, "rate_kw": None, "mode": None,
+                                "finish_at": None, "estimating": False},
+                    "occurred_at": now}
+        self.assertEqual(self.request("POST", base + "/activity", activity)[0], 401)
+        self.assertEqual(self.request("POST", base + "/activity", activity, auth)[0], 202)
+
 
 class SenderTests(unittest.TestCase):
     def test_fcm_message_targets_only_fid_with_small_data(self):
@@ -305,6 +451,71 @@ class SenderTests(unittest.TestCase):
         self.assertEqual(message["android"]["notification"]["channel_id"], "voltmoss_alerts")
         self.assertEqual(message["apns"]["headers"]["apns-push-type"], "alert")
         self.assertIn("19%", message["notification"]["body"])
+
+
+class ActivitySenderTests(unittest.TestCase):
+    class Recording:
+        class UnregisteredError(Exception):
+            pass
+
+        def __init__(self):
+            self.message = None
+
+        def __getattr__(self, name):
+            if name in ("Message", "APNSConfig", "APNSPayload", "Aps", "ApsAlert"):
+                return lambda **kwargs: {"type": name, **kwargs}
+            raise AttributeError(name)
+
+        def send(self, message, app):
+            self.message = message
+
+    def sender(self):
+        sender = FirebaseSender.__new__(FirebaseSender)
+        sender.copy = AlertCopy(COPY)
+        sender.messaging = self.Recording()
+        sender.app = object()
+        return sender
+
+    def row(self, event, phase="charging", **changes):
+        content = {"phase": phase, "soc": 64, "updated_at": 1000, "target_pct": 80,
+                   "rate_kw": 6.1, "mode": "ac", "finish_at": 5000, "estimating": False}
+        return {"fid": FID, "locale": "id", "event": event, "content": json.dumps(content),
+                "alert_minute": None, **changes}
+
+    def test_a_start_carries_the_charge_started_words_and_no_sound(self):
+        sender = self.sender()
+        sender.send_activity(self.row("start", alert_minute=16 * 60 + 44), "tok")
+        apns = sender.messaging.message["apns"]
+        self.assertEqual(apns["live_activity_token"], "tok")
+        self.assertEqual(apns["headers"]["apns-priority"], "10")
+        aps = apns["payload"]["aps"]
+        self.assertIn("16:44", aps["alert"]["body"])
+        self.assertNotIn("sound", aps)
+        fields = aps["custom_data"]
+        self.assertEqual(fields["event"], "start")
+        self.assertEqual(fields["content-state"]["lang"], "id")
+
+    def test_updates_are_quiet_and_a_complete_end_clears_after_half_an_hour(self):
+        sender = self.sender()
+        sender.send_activity(self.row("update"), "tok")
+        apns = sender.messaging.message["apns"]
+        self.assertEqual(apns["headers"]["apns-priority"], "5")
+        self.assertIsNone(apns["payload"]["aps"]["alert"])
+        with patch("time.time", return_value=2000):
+            sender.send_activity(self.row("end", phase="complete"), "tok")
+        fields = sender.messaging.message["apns"]["payload"]["aps"]["custom_data"]
+        self.assertEqual(fields["dismissal-date"], 2000 + 30 * 60)
+        sender.send_activity(self.row("end", phase="stopped"), "tok")
+        fields = sender.messaging.message["apns"]["payload"]["aps"]["custom_data"]
+        self.assertNotIn("dismissal-date", fields)
+
+    def test_a_refused_activity_token_is_not_a_dead_installation(self):
+        sender = self.sender()
+        def refuse(message, app):
+            raise sender.messaging.UnregisteredError()
+        sender.messaging.send = refuse
+        with self.assertRaises(InvalidActivityToken):
+            sender.send_activity(self.row("update"), "tok")
 
 
 class LiveActivityTests(unittest.TestCase):

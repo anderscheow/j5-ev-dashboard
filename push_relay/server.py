@@ -21,6 +21,8 @@ from .sender import FirebaseSender
 
 _INSTALLATION = re.compile(r"^/v1/installations/([A-Za-z0-9_-]{16,64})$")
 _EVENTS = re.compile(r"^/v1/installations/([A-Za-z0-9_-]{16,64})/events$")
+_ACTIVITY = re.compile(r"^/v1/installations/([A-Za-z0-9_-]{16,64})/activity$")
+_ACTIVITY_TOKENS = re.compile(r"^/v1/installations/([A-Za-z0-9_-]{16,64})/activity-tokens$")
 
 
 def handler_for(relay, verify_app_check, allowed_app_ids, metrics_secret=""):
@@ -105,13 +107,23 @@ def handler_for(relay, verify_app_check, allowed_app_ids, metrics_secret=""):
                     self._json(201, relay.create(self._body()))
                 elif match := _EVENTS.fullmatch(path):
                     self._json(202, relay.enqueue(match[1], self._secret(), self._body()))
+                elif match := _ACTIVITY.fullmatch(path):
+                    self._json(202, relay.enqueue_activity(match[1], self._secret(),
+                                                           self._body()))
                 else:
                     raise ApiError(404, "not found")
             self._handle(run)
 
         def do_PUT(self):
             def run():
-                match = _INSTALLATION.fullmatch(urlsplit(self.path).path)
+                path = urlsplit(self.path).path
+                if match := _ACTIVITY_TOKENS.fullmatch(path):
+                    # From the app's native code, in a background wake as often as not:
+                    # the installation secret is the credential, as it is for events.
+                    self._json(200, relay.set_activity_tokens(match[1], self._secret(),
+                                                              self._body()))
+                    return
+                match = _INSTALLATION.fullmatch(path)
                 if not match:
                     raise ApiError(404, "not found")
                 self._app_check()
@@ -155,6 +167,7 @@ def main():
         while not stop.wait(1):
             try:
                 relay.drain_due()
+                relay.drain_activities()
                 if time.time() - last_cleanup > 3600:
                     relay.cleanup()
                     last_cleanup = time.time()

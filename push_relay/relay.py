@@ -35,6 +35,17 @@ _FID = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 _SECRET = re.compile(r"^[0-9a-fA-F]{64}$")
 _EVENT = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
 
+# The charging Live Activity. The dashboard posts what the activity should show; the phone posts
+# the ActivityKit tokens that address it. Only the newest state per phone is worth sending, so the
+# queue keeps one row per installation instead of one per event.
+ACTIVITY_EVENTS = frozenset(("start", "update", "end"))
+ACTIVITY_PHASES = frozenset(("charging", "complete", "stopped"))
+ACTIVITY_KEYS = frozenset(("phase", "soc", "updated_at", "target_pct", "rate_kw", "mode",
+                           "finish_at", "estimating"))
+ACTIVITY_LIFETIME = 10 * 60
+MAX_ACTIVITY_PER_HOUR = 90
+_TOKEN = re.compile(r"^[0-9a-f]{16,512}$")
+
 
 class ApiError(Exception):
     def __init__(self, status, message):
@@ -108,7 +119,34 @@ class RelayStore:
                     secret_hash TEXT NOT NULL,
                     deleted_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS activity_pushes (
+                    installation_id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    alert_minute INTEGER,
+                    occurred_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt INTEGER NOT NULL,
+                    lease_until INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS activity_due ON activity_pushes(state, next_attempt);
+                CREATE TABLE IF NOT EXISTS activity_log (
+                    installation_id TEXT NOT NULL,
+                    at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS activity_recent ON activity_log(installation_id, at);
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(installations)")}
+            # The phone's ActivityKit tokens: push-to-start (one per install, iOS 17.2+) and the
+            # update token of the activity on screen, with when it was last set.
+            for column, kind in (("la_start_token", "TEXT"), ("la_update_token", "TEXT"),
+                                 ("la_update_at", "INTEGER NOT NULL DEFAULT 0")):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE installations ADD COLUMN {column} {kind}")
 
     @contextmanager
     def connect(self):
@@ -308,6 +346,155 @@ class Relay:
                         (int(self.now()), row["installation_id"], row["event_id"]))
         return sent
 
+    def set_activity_tokens(self, installation_id, secret, body):
+        """The phone's ActivityKit tokens. Either may be sent alone; null forgets it.
+
+        Called by the app's native code, which may run in a background wake with no Flutter and
+        no App Check, so the installation secret is the whole credential -- the same one the
+        dashboard holds, and a token only ever addresses this installation's own app."""
+        if (not isinstance(body, dict) or not body or
+                not set(body) <= {"push_to_start", "update"}):
+            raise ApiError(400, "invalid activity tokens")
+        for value in body.values():
+            if value is not None and (not isinstance(value, str) or not _TOKEN.fullmatch(value)):
+                raise ApiError(400, "invalid activity token")
+        now = int(self.now())
+        with self.store.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._authorize(conn, installation_id, secret)
+            if "push_to_start" in body:
+                conn.execute("UPDATE installations SET la_start_token=? WHERE id=?",
+                             (body["push_to_start"], installation_id))
+            if "update" in body:
+                conn.execute("UPDATE installations SET la_update_token=?,la_update_at=? WHERE id=?",
+                             (body["update"], now, installation_id))
+            conn.execute("UPDATE installations SET last_seen=? WHERE id=?",
+                         (now, installation_id))
+        return {"ok": True}
+
+    @staticmethod
+    def _activity_content(content, now):
+        if not isinstance(content, dict) or set(content) != ACTIVITY_KEYS:
+            raise ApiError(400, "invalid activity content")
+        soc, updated = content["soc"], content["updated_at"]
+        if (content["phase"] not in ACTIVITY_PHASES or type(soc) is not int or
+                not 0 <= soc <= 100 or type(updated) is not int or
+                not now - 86400 <= updated <= now + 120 or
+                type(content["estimating"]) is not bool):
+            raise ApiError(400, "invalid activity content")
+        target, rate, finish = content["target_pct"], content["rate_kw"], content["finish_at"]
+        if target is not None and (type(target) is not int or not 1 <= target <= 100):
+            raise ApiError(400, "invalid activity target")
+        if rate is not None and (type(rate) not in (int, float) or not math.isfinite(rate) or
+                                 not 0 <= rate <= 1000):
+            raise ApiError(400, "invalid activity rate")
+        if content["mode"] not in (None, "ac", "dc"):
+            raise ApiError(400, "invalid activity mode")
+        if finish is not None and (type(finish) is not int or not updated <= finish <= updated + 86400):
+            raise ApiError(400, "invalid activity finish")
+        return {key: content[key] for key in sorted(ACTIVITY_KEYS)}
+
+    def enqueue_activity(self, installation_id, secret, body):
+        """What the charging Live Activity should show now, from the dashboard.
+
+        Latest wins: an update that lands before an unsent start keeps the start (with the newer
+        content), and anything else replaces whatever was waiting."""
+        # Nothing that identifies the car: no model, plate or VIN reaches the relay, so a
+        # remote start carries no vehicle label.
+        if (not isinstance(body, dict) or
+                not {"event_id", "event", "content", "occurred_at"} <= set(body) <=
+                {"event_id", "event", "content", "occurred_at", "alert_minute"}):
+            raise ApiError(400, "invalid activity")
+        event_id, event = body["event_id"], body["event"]
+        if (not isinstance(event_id, str) or not _EVENT.fullmatch(event_id) or
+                event not in ACTIVITY_EVENTS):
+            raise ApiError(400, "invalid activity")
+        minute = body.get("alert_minute")
+        if minute is not None and (type(minute) is not int or not 0 <= minute < 1440):
+            raise ApiError(400, "invalid time")
+        now = int(self.now())
+        occurred = body["occurred_at"]
+        if type(occurred) is not int or occurred > now + 120 or occurred < now - ACTIVITY_LIFETIME:
+            raise ApiError(410, "activity expired")
+        content = json.dumps(self._activity_content(body["content"], now), separators=(",", ":"))
+        with self.store.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._authorize(conn, installation_id, secret)
+            waiting = conn.execute("""SELECT event_id,event,state,alert_minute
+                FROM activity_pushes WHERE installation_id=?""", (installation_id,)).fetchone()
+            if waiting and waiting["event_id"] == event_id:
+                return {"accepted": True, "duplicate": True}
+            recent = conn.execute("""SELECT COUNT(*) FROM activity_log WHERE installation_id=?
+                AND at>=?""", (installation_id, now - 3600)).fetchone()[0]
+            if recent >= MAX_ACTIVITY_PER_HOUR:
+                raise ApiError(429, "activity rate limit")
+            if (event == "update" and waiting and waiting["event"] == "start" and
+                    waiting["state"] == "pending"):
+                event, minute = "start", waiting["alert_minute"]
+            conn.execute("""INSERT OR REPLACE INTO activity_pushes
+                (installation_id,event_id,event,content,alert_minute,occurred_at,expires_at,
+                 next_attempt) VALUES (?,?,?,?,?,?,?,?)""",
+                (installation_id, event_id, event, content, minute, occurred,
+                 occurred + ACTIVITY_LIFETIME, now))
+            conn.execute("INSERT INTO activity_log(installation_id,at) VALUES (?,?)",
+                         (installation_id, now))
+        return {"accepted": True, "duplicate": False}
+
+    def drain_activities(self, limit=20):
+        """Send the waiting activity states. A start needs the push-to-start token and anything
+        else the update token; a phone without the one it needs (Android, iOS before 17.2, Live
+        Activities switched off) is skipped rather than retried."""
+        now = int(self.now())
+        sent = 0
+        for _ in range(limit):
+            with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("""SELECT a.*,i.fid,i.platform,i.locale,i.la_start_token,
+                    i.la_update_token FROM activity_pushes a
+                    JOIN installations i ON i.id=a.installation_id
+                    WHERE a.state IN ('pending','sending') AND a.next_attempt<=?
+                    AND a.lease_until<=? ORDER BY a.next_attempt LIMIT 1""",
+                    (now, now)).fetchone()
+                if row is None:
+                    break
+                key = (row["installation_id"], row["event_id"])
+                token = row["la_start_token"] if row["event"] == "start" else row["la_update_token"]
+                if row["expires_at"] <= now or row["attempts"] >= 4 or not token:
+                    conn.execute("""UPDATE activity_pushes SET state=? WHERE installation_id=?
+                        AND event_id=?""", ("skipped" if not token else "expired", *key))
+                    continue
+                conn.execute("""UPDATE activity_pushes SET state='sending',attempts=attempts+1,
+                    lease_until=? WHERE installation_id=? AND event_id=?""", (now + 60, *key))
+            started = int(self.now())
+            try:
+                self.sender.send_activity(dict(row), token)
+            except InvalidActivityToken:
+                # APNs no longer knows the token -- the activity ended, or the app was
+                # reinstalled. Forget it so nothing more is addressed to it.
+                column = "la_start_token" if row["event"] == "start" else "la_update_token"
+                with self.store.connect() as conn:
+                    conn.execute(f"UPDATE installations SET {column}=NULL WHERE id=?", (key[0],))
+                    conn.execute("""UPDATE activity_pushes SET state='rejected',lease_until=0
+                        WHERE installation_id=? AND event_id=?""", key)
+            except Exception:
+                delay = min(15 * (2 ** row["attempts"]), 120)
+                with self.store.connect() as conn:
+                    conn.execute("""UPDATE activity_pushes SET state='pending',next_attempt=?,
+                        lease_until=0 WHERE installation_id=? AND event_id=?""",
+                        (now + delay, *key))
+            else:
+                sent += 1
+                with self.store.connect() as conn:
+                    conn.execute("""UPDATE activity_pushes SET state='sent',lease_until=0
+                        WHERE installation_id=? AND event_id=?""", key)
+                    if row["event"] == "start":
+                        # A push-to-start makes a new activity, which reports its own update
+                        # token; the old one addresses an activity that is gone. One the phone
+                        # posted after this send began belongs to the new activity and stays.
+                        conn.execute("""UPDATE installations SET la_update_token=NULL
+                            WHERE id=? AND la_update_at<?""", (key[0], started))
+        return sent
+
     def cleanup(self, stale_days=90):
         now = int(self.now())
         with self.store.connect() as conn:
@@ -315,13 +502,22 @@ class Relay:
             conn.execute("DELETE FROM events WHERE expires_at<?", (now-7*86400,))
             conn.execute("DELETE FROM registration_attempts WHERE created_at<?", (now-86400,))
             conn.execute("DELETE FROM installation_tombstones WHERE deleted_at<?", (now-7*86400,))
+            conn.execute("DELETE FROM activity_pushes WHERE expires_at<? AND state NOT IN "
+                         "('pending','sending')", (now-86400,))
+            conn.execute("DELETE FROM activity_log WHERE at<?", (now-86400,))
 
     def metrics(self):
         with self.store.connect() as conn:
             installs = conn.execute("SELECT COUNT(*) FROM installations").fetchone()[0]
             states = dict(conn.execute("SELECT state,COUNT(*) FROM events GROUP BY state").fetchall())
-        return {"installations": installs, "events": states}
+            activities = dict(conn.execute(
+                "SELECT state,COUNT(*) FROM activity_pushes GROUP BY state").fetchall())
+        return {"installations": installs, "events": states, "activities": activities}
 
 
 class InvalidInstallation(Exception):
     """FCM reports that a FID is no longer registered."""
+
+
+class InvalidActivityToken(Exception):
+    """APNs no longer accepts a Live Activity token."""
