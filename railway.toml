@@ -1,0 +1,21 @@
+# The fork's own host (upstream has none). One Railway service runs the
+# dashboard, the logger and -- with VOLTMOSS_PUSH_DISPATCHER=1 -- the push
+# dispatcher, sharing the /data volume: see tools/railway_start.sh.
+#
+# The start command lives here, in the repo, on purpose. The image's own CMD is
+# the dashboard alone (0259f55), so a service that loses this setting keeps
+# serving pages while logging nothing: on 2026-11-02 a rebuild of main and
+# staging did exactly that, and both environments stopped recording the car
+# without an error anywhere.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "bash railway_start.sh"
+# /api/status answers before the dashboard is configured or unlocked, so a
+# deploy that cannot serve it never replaces one that can.
+healthcheckPath = "/api/status"
+healthcheckTimeout = 60
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

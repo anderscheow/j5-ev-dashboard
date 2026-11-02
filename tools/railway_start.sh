@@ -22,7 +22,9 @@ elif [ ! -f "$DATA/creds.json" ]; then
   echo "railway_start: WARNING — no CREDS_JSON variable and no $DATA/creds.json in the volume" >&2
 fi
 
-python logger.py --adaptive &
+# Restarted like the dispatcher below: a logger that dies leaves the dashboard serving an
+# ever-older last frame with no error anywhere, so it must not stay dead until the next deploy.
+(while true; do python logger.py --adaptive; echo "railway_start: logger exited; restarting in 15 s" >&2; sleep 15; done) &
 if [ "${VOLTMOSS_PUSH_DISPATCHER:-0}" = "1" ]; then
   # Restarted like tools/run.py does: a dead dispatcher only withdraws push_alerts from
   # /api/status, which is safe but silent, so it must not stay dead until the next deploy.
