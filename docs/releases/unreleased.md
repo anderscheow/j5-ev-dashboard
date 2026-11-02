@@ -34,3 +34,7 @@
   is the petrol those km would have cost less the actual charging spend. Both
   move on existing installs even with no price book; see `docs/api-map.md`.
   Demo mode does not offer the price book.
+- The summary and `/api/history` now carry the meter's kWh beside the pack's wherever charging is
+  totalled: `charging.session_kwh_billed`, `week_kwh_billed`, `month_kwh_billed`, and
+  `chg_kwh_billed` / `charges[].kwh_billed` per day and for the month. Costs were already priced on
+  it; the web dashboard now shows it first. Additive, no `api_version` bump.

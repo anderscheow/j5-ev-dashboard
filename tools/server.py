@@ -1134,7 +1134,10 @@ def analyze(data, trips, kwh_day, book):
         "battery_kwh": CAP_KWH, "top_speed_today": 0,
         "energy": {"today_kwh": 0.0, "consumption": None, "rating": None, "week_consumption": None},
         "charging": {"active": False, "session_kwh": 0.0, "rate_kw": None, "soc": None,
-                     "week": 0, "month": 0, "week_kwh": 0.0, "month_kwh": 0.0, "session": None},
+                     "week": 0, "month": 0, "week_kwh": 0.0, "month_kwh": 0.0, "session": None,
+                     # *_kwh is what went into the pack; *_kwh_billed what the meter charged
+                     # for it -- the kWh every cost here is priced on
+                     "session_kwh_billed": 0.0, "week_kwh_billed": 0.0, "month_kwh_billed": 0.0},
     }
     today = time.strftime("%Y-%m-%d"); week = time.strftime("%Y-W%W"); month = time.strftime("%Y-%m")
     fr = [(ts, d.get("battery"), d.get("odometer")) for ts, dt, d in data
@@ -1153,10 +1156,12 @@ def analyze(data, trips, kwh_day, book):
     for s in sess:
         if time.strftime("%Y-W%W", time.localtime(s["start"])) == week:
             out["charging"]["week"] += 1; out["charging"]["week_kwh"] += s["kwh"]
+            out["charging"]["week_kwh_billed"] += s["billed"]
         if time.strftime("%Y-%m", time.localtime(s["start"])) == month:
             out["charging"]["month"] += 1; out["charging"]["month_kwh"] += s["kwh"]
-    out["charging"]["week_kwh"] = round(out["charging"]["week_kwh"], 1)
-    out["charging"]["month_kwh"] = round(out["charging"]["month_kwh"], 1)
+            out["charging"]["month_kwh_billed"] += s["billed"]
+    for k in ("week_kwh", "month_kwh", "week_kwh_billed", "month_kwh_billed"):
+        out["charging"][k] = round(out["charging"][k], 1)
     out["charging"]["month_cost"] = round(sum(
         s["cost"] for s in sess if time.strftime("%Y-%m", time.localtime(s["start"])) == month))
     out["charging"]["history"] = [                     # recent finished/ongoing sessions, newest first
@@ -1205,6 +1210,7 @@ def analyze(data, trips, kwh_day, book):
     if live:
         lr = live_rate(live["pts"])
         out["charging"].update(active=True, session_kwh=round(live["kwh"], 2), soc=live["soc1"],
+                               session_kwh_billed=round(live["billed"], 2),
                                rate_kw=round(lr if lr is not None else live["avg"], 1))
     detail = live or (sess[-1] if sess else None)
     if detail:
@@ -1308,11 +1314,13 @@ def demo_month(y, m, ndays):
         rg = round(kwh * rnd.uniform(0.05, 0.12), 1)
         chg = d <= last and d % 6 == 2
         ck = round(rnd.uniform(24, 46), 1) if chg else 0
+        cb = round(ck / 0.92, 1) if chg else 0
         days.append({"d": d, "km": km, "kwh": kwh, "eff": eff, "kwh_hu": round(kwh + rg, 1),
                      "eff_hu": round((kwh + rg) / km * 100, 1) if eff else None, "regen": rg,
-                     "chg_kwh": ck, "chg_cost": round(ck / 0.92 * TARIFF_IDR) if chg else 0,
+                     "chg_kwh": ck, "chg_kwh_billed": cb, "chg_cost": round(cb * TARIFF_IDR),
                      "trips": [{"from": "07:40", "to": "08:25", "km": km, "min": 45}] if km else [],
-                     "charges": [{"at": "19:10", "kwh": ck, "cost": round(ck / 0.92 * TARIFF_IDR),
+                     "charges": [{"at": "19:10", "kwh": ck, "kwh_billed": cb,
+                                  "cost": round(cb * TARIFF_IDR),
                                   "soc0": 34, "soc1": 88, "min": 38, "avg_kw": 48.5}] if chg else []})
     ok = [x for x in days if x["eff"] is not None]
     ok_km = sum(x["km"] for x in ok)
@@ -1320,6 +1328,7 @@ def demo_month(y, m, ndays):
             "totals": {"km": sum(x["km"] for x in days),
                        "kwh": round(sum(x["kwh"] for x in days), 1),
                        "chg_kwh": round(sum(x["chg_kwh"] for x in days), 1),
+                       "chg_kwh_billed": round(sum(x["chg_kwh_billed"] for x in days), 1),
                        "chg_cost": round(sum(x["chg_cost"] for x in days)),
                        "days_driven": sum(1 for x in days if x["km"] > 0),
                        "trips": sum(len(x["trips"]) for x in days),
@@ -1380,6 +1389,7 @@ def demo_summary():
                    "week_consumption": 13.0, "source": "car"},
         "charging": {"active": False, "session_kwh": 0.0, "rate_kw": None, "soc": None,
                      "week": 2, "month": 9, "week_kwh": 65.9, "month_kwh": 312.4, "month_cost": 921000,
+                     "session_kwh_billed": 0.0, "week_kwh_billed": 72.7, "month_kwh_billed": 346.1,
                      "history": chist,
                      "session": {"ongoing": False, "start_dt": time.strftime("%H:%M", time.localtime(now - 7 * 3600)),
                                  "dur_min": 47, "kwh": 41.2, "soc0": 18, "soc1": 88, "avg_kw": 52.6,
@@ -1710,7 +1720,8 @@ def _summary():
                       "week_consumption": None},
            "charging": {"active": False, "session_kwh": 0.0, "rate_kw": None, "soc": None,
                         "week": 0, "month": 0, "week_kwh": 0.0, "month_kwh": 0.0,
-                        "month_cost": 0, "history": [], "session": None},
+                        "session_kwh_billed": 0.0, "week_kwh_billed": 0.0,
+                        "month_kwh_billed": 0.0, "month_cost": 0, "history": [], "session": None},
            "trips": [],
            "tpms": [{"pos": p, "psi": None, "temp": None, "valid": False} for p in TPMS_POS],
            "tpms_updated": None, "tpms_age_min": None, "tpms_live": False, "tpms_raw": None,
@@ -1885,7 +1896,7 @@ def month_history(month):
     y, m, t0, t1 = _month_bounds(month)
     ndays = calendar.monthrange(y, m)[1]
     empty = {"month": f"{y:04d}-{m:02d}", "days": [],
-             "totals": {"km": 0, "kwh": 0.0, "chg_kwh": 0.0, "chg_cost": 0},
+             "totals": {"km": 0, "kwh": 0.0, "chg_kwh": 0.0, "chg_kwh_billed": 0.0, "chg_cost": 0},
              "resync_km": "skip"}
     if DEMO:
         return demo_month(y, m, ndays)
@@ -1908,15 +1919,17 @@ def month_history(month):
     fr = [(ts, d2.get("battery"), d2.get("odometer")) for ts, dt2, d2 in data
           if d2.get("battery") is not None and d2.get("odometer") is not None]
     sess = priced_sessions(data, fr, t1, _book())
-    chg = {}                                            # day -> aggregated charging (in + metered cost)
+    chg = {}                                            # day -> aggregated charging (in, metered, cost)
     for s in sess:
         k = time.strftime("%Y-%m-%d", time.localtime(s["start"]))
-        d = chg.setdefault(k, {"kwh": 0.0, "cost": 0, "n": 0, "list": []})
+        d = chg.setdefault(k, {"kwh": 0.0, "billed": 0.0, "cost": 0, "n": 0, "list": []})
         d["kwh"] += s["kwh"]
+        d["billed"] += s["billed"]
         d["cost"] += s["cost"]
         d["n"] += 1
         d["list"].append({"at": time.strftime("%H:%M", time.localtime(s["start"])),
-                          "kwh": round(s["kwh"], 1), "cost": round(s["cost"]),
+                          "kwh": round(s["kwh"], 1), "kwh_billed": round(s["billed"], 1),
+                          "cost": round(s["cost"]),
                           "soc0": s["soc0"], "soc1": s["soc1"],
                           "min": round(s["dur_h"] * 60), "avg_kw": round(s["avg"], 1),
                           **session_price(s)})
@@ -1934,6 +1947,7 @@ def month_history(month):
                      "eff": net_eff(u, r, km, eff), "kwh_hu": round(u, 1), "eff_hu": eff,
                      "regen": round(rk, 1),
                      "chg_kwh": round(c["kwh"], 1) if c else 0,
+                     "chg_kwh_billed": round(c["billed"], 1) if c else 0,
                      "chg_cost": round(c["cost"]) if c else 0,
                      "trips": trips_day.get(k, []),
                      "charges": c["list"] if c else []})
@@ -1944,6 +1958,7 @@ def month_history(month):
             "totals": {"km": sum(x["km"] for x in days),
                        "kwh": round(sum(x["kwh"] for x in days), 1),
                        "chg_kwh": round(sum(x["chg_kwh"] for x in days), 1),
+                       "chg_kwh_billed": round(sum(x["chg_kwh_billed"] for x in days), 1),
                        "chg_cost": round(sum(x["chg_cost"] for x in days)),
                        "days_driven": sum(1 for x in days if x["km"] > 0),
                        "trips": sum(len(x["trips"]) for x in days),

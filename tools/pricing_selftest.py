@@ -294,6 +294,14 @@ class ServerTest(unittest.TestCase):
                          sorted(s["id"] for s in listing["sessions"]))
         self.assertEqual(sorted(c["cost"] for c in calendar),
                          sorted(s["cost"] for s in listing["sessions"]))
+        # the calendar carries the meter's kWh each cost was priced on, beside the pack's
+        self.assertEqual(sorted(c["kwh_billed"] for c in calendar),
+                         sorted(s["kwh_billed"] for s in listing["sessions"]))
+        totals = server.month_history(self.month)["totals"]
+        self.assertAlmostEqual(totals["chg_kwh_billed"], listing["totals"]["kwh_billed"], delta=0.15)
+        self.assertGreater(totals["chg_kwh_billed"], totals["chg_kwh"])
+        self.assertAlmostEqual(sum(d["chg_kwh_billed"] for d in days), totals["chg_kwh_billed"],
+                               delta=0.15)
 
     def test_summary_reprices_lifetime_and_running_cost_from_what_was_paid(self):
         server.pricing.put_book(server.PRICE_DB, pricing.validate_book({
@@ -311,6 +319,13 @@ class ServerTest(unittest.TestCase):
                          max(0, out["lifetime"]["petrol_cost"] - out["lifetime"]["cost"]))
         self.assertEqual([h["id"] for h in out["charging"]["history"]][::-1],
                          [s["id"] for s in listing["sessions"]])
+        # this month's meter kWh: the sessions (two days back, so maybe last month) that began in it
+        month = time.strftime("%Y-%m")
+        self.assertAlmostEqual(out["charging"]["month_kwh_billed"],
+                               sum(h["kwh_billed"] for h in out["charging"]["history"]
+                                   if time.strftime("%Y-%m", time.localtime(h["id"])) == month),
+                               delta=0.15)
+        self.assertGreaterEqual(out["charging"]["month_kwh_billed"], out["charging"]["month_kwh"])
 
     def test_an_unreadable_price_book_prices_from_creds(self):
         with open(server.PRICE_DB, "w") as f:

@@ -492,6 +492,16 @@ takes it before the charger has ramped up — 351 min at plug-in and 146 min a m
 152-minute charge (2026-10-28), and 306 walking down to ~230 over the first ten minutes of a 3.2 kW
 charge (2026-10-24). Voltmoss quotes a finish time only from five minutes in.
 
+**Meter kWh beside every charge total (additive, 2026-11-02).** Every charging cost is priced on the
+kWh the meter charged for (`kwh_billed`: the receipt's where the owner entered one, else the pack
+kWh over the charging efficiency), but the summary's totals and the calendar only carried the kWh
+that went into the pack. They now carry the meter's figure beside it, so a client can show the kWh
+a cost was priced on: `charging.session_kwh_billed`, `charging.week_kwh_billed` and
+`charging.month_kwh_billed` beside `session_kwh` / `week_kwh` / `month_kwh`, and in
+`/api/history` `days[].chg_kwh_billed`, `days[].charges[].kwh_billed` and
+`totals.chg_kwh_billed` beside `chg_kwh` / `kwh`. Nothing existing changed, so `api_version` is not
+bumped; a client reading an older dashboard finds these absent and has only the pack's kWh.
+
 ### Fuel range — RESOLVED ✅ (bytes 70–71)
 
 Three captures settle what one couldn't. The pair is **the car's headline range**: a BEV writes its
