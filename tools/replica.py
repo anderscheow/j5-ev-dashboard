@@ -61,19 +61,23 @@ def _connect(db):
     return conn
 
 
-def _newest(conn):
-    try:
-        return conn.execute("SELECT max(ts) FROM telemetry").fetchone()[0] or 0
-    except sqlite3.OperationalError:              # no table yet: a mirror's first run
-        return 0
+def _cursor(conn, source):
+    """How far into `source`'s telemetry this mirror has read. Kept apart from the mirror's own
+    newest frame: a mirror that held frames before it began mirroring -- newer ones, even --
+    must still take every frame the source has, from the first."""
+    conn.execute("CREATE TABLE IF NOT EXISTS replica_cursor "
+                 "(source TEXT PRIMARY KEY, after INTEGER NOT NULL)")
+    row = conn.execute("SELECT after FROM replica_cursor WHERE source = ?", (source,)).fetchone()
+    return row[0] if row else 0
 
 
 def sync_telemetry(db, source, token):
-    """Pulls every frame newer than ten minutes before this mirror's newest. Answers how many
-    rows were written."""
+    """Pulls every frame `source` recorded since ten minutes before where this mirror last read
+    to -- everything, on a first run. Answers how many rows were written."""
     conn = _connect(db)
     try:
-        after, written = max(0, _newest(conn) - OVERLAP), 0
+        cursor, written = _cursor(conn, source), 0
+        after = max(0, cursor - OVERLAP) if cursor else 0
         while True:
             status, body, _etag = _get(source, token,
                                        "/api/replica/telemetry?after=%d&limit=%d" % (after, PAGE))
@@ -94,9 +98,12 @@ def sync_telemetry(db, source, token):
                     "INSERT OR REPLACE INTO telemetry (%s) VALUES (%s)"
                     % (",".join(names), ",".join("?" * len(names))),
                     [[row[i] for i in keep] for row in rows])
+                after = rows[-1][columns.index("ts")]
+                # the rows and how far they reach commit together, or neither does
+                conn.execute("INSERT OR REPLACE INTO replica_cursor VALUES (?, ?)",
+                             (source, max(after, cursor)))
                 conn.commit()
                 written += len(rows)
-                after = rows[-1][columns.index("ts")]
             if not page.get("more"):
                 return written
     finally:

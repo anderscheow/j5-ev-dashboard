@@ -87,14 +87,17 @@ class ReplicaTest(unittest.TestCase):
 
     def test_telemetry_merges_pages_and_catches_a_late_frame(self):
         frames(self.src_db, [(1000 + i, 60 + i) for i in range(10)])
-        # the mirror's own frames from before it mirrored; 1005 clashes with production's
-        frames(self.dst_db, [(500, 1), (1005, 99)])
+        # The mirror's own frames from before it mirrored: 1005 clashes with production's, and
+        # 5000 is newer than anything production has -- staging's own logger ran until today,
+        # and a cursor taken from its newest frame skipped production's whole history.
+        frames(self.dst_db, [(500, 1), (1005, 99), (5000, 3)])
         with patch.object(replica, "PAGE", 3):
             self.assertEqual(replica.sync_telemetry(self.dst_db, self.url, TOKEN), 10)
             rows = table(self.dst_db)
-            self.assertEqual(rows[0], (500, 1))                   # its own frame stays
+            self.assertEqual(rows[0], (500, 1))                   # its own frames stay
+            self.assertEqual(rows[-1], (5000, 3))
             self.assertIn((1005, 65), rows)                       # production wins the clash
-            self.assertEqual(len(rows), 11)
+            self.assertEqual(len(rows), 12)
             # Running again rewrites only the overlap; nothing is lost or doubled.
             replica.sync_telemetry(self.dst_db, self.url, TOKEN)
             self.assertEqual(table(self.dst_db), rows)
