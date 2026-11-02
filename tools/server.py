@@ -4,6 +4,7 @@ Run: python server.py [port]   (default 8088, binds 0.0.0.0 so Tailscale can rea
 """
 import os, sys, json, time, sqlite3, threading, math, calendar, copy, tempfile, urllib.request, urllib.parse
 import logging, traceback
+from collections import deque
 import hmac, hashlib, base64, secrets, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import known_cars          # per-model constants the telemetry never carries (pack size, tyre scale)
@@ -1427,14 +1428,45 @@ def _tyre_fields(frame, latest_ts, now):
         out["tyre_status"] = "Check tyres" if any(p < 28 or p > 40 for p in raw_psi) else "Normal"
     return out
 
+# 12V watch thresholds. The car reports its 12V in steps of ~0.21 V (12.15, 12.36, 12.57 ...), and a
+# healthy battery parked overnight rests at 12.36-12.57 V -- about two-thirds charged, so the old
+# 12.5 V "low" line flagged every ordinary night. ~12.2 V is half charge; 11.9 V is flat enough that
+# the car may not wake, the same line Voltmoss applies when the dashboard sends no verdict.
+VOLT12_LOW = 12.2
+VOLT12_CRITICAL = 11.9
+# A reading counts only once the 12V has stayed at or under it this long. Waking the car sags it for
+# under a minute (12.15 V at unlock on a battery resting at 12.36) until the DC-DC converter takes
+# over; a battery that is really running down reads low for hours.
+VOLT12_SUSTAIN_S = 5 * 60
+
+def _sustained_min(points, span):
+    """Lowest level the readings stayed at or under for `span` seconds: over every stretch of
+    [(ts, value)] (oldest first) at least `span` long, the stretch's highest reading, then the
+    lowest of those. None until some stretch is that long."""
+    best, peak, end = None, deque(), 0  # peak: indices in the current stretch, values decreasing
+    for start, (t0, _) in enumerate(points):
+        if peak and peak[0] < start:
+            peak.popleft()
+        while end < len(points) and (end <= start or points[end - 1][0] - t0 < span):
+            while peak and points[peak[-1]][1] <= points[end][1]:
+                peak.pop()
+            peak.append(end)
+            end += 1
+        if points[end - 1][0] - t0 < span:
+            break                          # no later start can span it either
+        held = points[peak[0]][1]
+        best = held if best is None else min(best, held)
+    return best
+
 def _volt12_watch(data, now):
-    """12V battery watch (directly measured): 7-day min + status (readings are DC-DC-supported while awake)."""
-    v7 = [d2.get("volt12") for ts2, dt2, d2 in data if d2.get("volt12") and now - ts2 <= 7 * 86400]
-    if not v7:
+    """12V battery watch (directly measured): the lowest level it held over 7 days, and a status.
+    Readings are DC-DC-supported while the car is awake; brief sags at wake-up are not counted."""
+    v7 = [(ts2, d2["volt12"]) for ts2, dt2, d2 in data if d2.get("volt12") and now - ts2 <= 7 * 86400]
+    mn = _sustained_min(v7, VOLT12_SUSTAIN_S)
+    if mn is None:
         return {}
-    mn = min(v7)
     return {"volt12_min7d": round(mn, 2),
-            "volt12_status": "critical" if mn < 12.0 else ("low" if mn < 12.5 else "ok")}
+            "volt12_status": "critical" if mn < VOLT12_CRITICAL else ("low" if mn < VOLT12_LOW else "ok")}
 
 def _car_charging(dec):
     """The car's own charging flags (b56/b57/b62-63), which beat the SoC-derived session detector:
