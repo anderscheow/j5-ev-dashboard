@@ -27,7 +27,8 @@ until it is merged. The maintainer release procedure is in
 intended server code. Run `python3 tools/ci_check.py`,
 `python3 tools/status_selftest.py`, `python3 tools/release_selftest.py`,
 `python3 tools/push_contract_selftest.py`,
-`python3 tools/push_dispatcher_selftest.py`, `python3 tools/pricing_selftest.py`, and
+`python3 tools/push_dispatcher_selftest.py`, `python3 tools/pricing_selftest.py`,
+`python3 tools/replica_selftest.py`, and
 `python3 -m unittest push_relay.test_relay` before tagging.
 
 The price book (`tools/pricing.py`, capability `price_book`) prices every
@@ -56,3 +57,27 @@ snapshot of the app's `alerts` translations: re-sync it with
 `python3 -m push_relay.sync_copy` whenever the app's alert copy changes. When
 the dispatcher starts sending a new kind or value, the relay must accept it
 first, so deploy the relay before the dashboard.
+
+The fork's own dashboard runs on Railway (project `tiggo-7-phev`, service
+`j5-ev-dashboard`): `production` deploys fork `main`, `staging` deploys fork
+`staging`, each with its own `/data` volume. Push to the `fork` remote; `origin`
+is upstream. The image's CMD is the dashboard alone, so what keeps the car
+logged is each environment's **start command**, `bash railway_start.sh` — a
+Railway service setting, not a file in the repo (this service ignores a root
+`railway.toml`). Set it per environment with `railway api` →
+`environmentPatchCommit`; `serviceInstanceUpdate` reaches every environment that
+is not a fork. On 2026-11-02 a rebuild deployed images without it and both
+environments stopped logging with no error anywhere, so after any deploy check
+the logs for `railway_start:` and `adaptive logging` (production) or
+`mirroring` (staging).
+
+Staging is a mirror of production, and only production talks to the car or
+sends alerts: CarLinko allows one live session per account. Production serves
+token-only `/api/replica/*` routes while `CARLINKO_REPLICA_TOKEN` is set;
+staging sets the same token and `CARLINKO_REPLICA_OF`, and `railway_start.sh`
+then runs `tools/replica.py` instead of the logger and the dispatcher. It merges
+telemetry (production's row wins a same-second clash; staging's older frames
+stay) and copies the owner's files — maintenance log, price book, car photo —
+when production's copy changes, keeping staging's own where production has
+none. `push_alerts.db`, `creds.json` and `token.txt` are never served. These
+routes are operations, not a client feature: no capability ID advertises them.
