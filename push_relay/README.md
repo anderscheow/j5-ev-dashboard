@@ -210,11 +210,30 @@ Sender secrets are 64 hex characters and are never echoed after creation.
 | `PUT /v1/installations/{id}` | App: App Check + `Authorization: Bearer <sender_secret>` | `{fid, locale}` → `200 {ok: true}` |
 | `DELETE /v1/installations/{id}` | App: App Check + sender secret | → `200 {ok: true}`. Retrying with the same secret stays 200 for seven days. |
 | `POST /v1/installations/{id}/events` | Dashboard: sender secret | `{event_id, kind, value, occurred_at}` → `202 {accepted, duplicate}` |
+| `PUT /v1/installations/{id}/activity-tokens` | App (native iOS, often a background wake): sender secret, **no** App Check | `{push_to_start?, update?}`, lowercase hex, or `null` to forget → `200 {ok: true}` |
+| `POST /v1/installations/{id}/activity` | Dashboard: sender secret | `{event_id, event: "start"\|"update"\|"end", content, occurred_at, alert_minute?}` → `202` |
 | `GET /healthz` | Health probe | `{ok: true}` |
 | `GET /internal/metrics` | Bearer `VOLTMOSS_RELAY_METRICS_SECRET` | Installation count and event states only. |
 
 The app sends `installation_id` and `sender_secret` to its own dashboard over HTTPS.
 That secret authorises events for that one installation only.
+
+**The charging Live Activity (iOS)** is driven through the last two routes:
+- **Tokens.** The phone registers its push-to-start and update tokens with
+  `activity-tokens`. There is no App Check on that route: the background wake
+  that delivers a push-started activity's update token may never reach the app
+  itself.
+- **Content.** The dashboard posts what the activity should show to `activity`.
+  `content` is the app's `ChargeActivityContent`, key for key.
+- **Queue.** Each installation keeps one row, and the latest post wins. An
+  update arriving before an unsent start stays a start.
+- **Delivery:**
+  - A start goes out through push-to-start, with the `charge_started` words and
+    no sound.
+  - Updates go at priority 5.
+  - A completed charge clears after 30 minutes.
+- **Tokens that fail.** A phone missing the token an event needs is skipped. A
+  token APNs refuses is forgotten, but the installation is kept.
 
 **Alert kinds and their `value`:**
 
