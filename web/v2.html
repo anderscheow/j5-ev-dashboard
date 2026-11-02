@@ -1183,7 +1183,7 @@ function renderCards(){
   const seatCaps = seatControls().length > 0;
   const chgSub = (S.charging && S.charging.active)
     ? 'Charging' + (S.charging.rate_kw != null ? ' \u00b7 ' + S.charging.rate_kw + ' kW' : '')
-    : (S.charging && S.charging.month_kwh ? S.charging.month_kwh + ' kWh this month' : 'No sessions yet');
+    : (S.charging && S.charging.month_kwh ? S.charging.month_kwh_billed + ' kWh this month' : 'No sessions yet');
   const battSub = (S.battery != null ? S.battery + '%' : '\u2014') +
     (S.volt12_status ? ' \u00b7 12V ' + S.volt12_status : '');
   const distSub = (S.km && S.km.today != null ? S.km.today + ' km today' : 'No driving yet');
@@ -1920,12 +1920,12 @@ function renderChg(){
     '<div class="panel"><svg id="cchart" viewBox="0 0 340 160"></svg>' +
     '<div class="cstats">' +
       '<div><b class="num">' + (s.dur_min != null ? s.dur_min + 'm' : '—') + '</b><span>duration</span></div>' +
-      '<div><b class="num">' + (s.kwh != null ? s.kwh : '—') + '</b><span>kWh in</span></div>' +
+      '<div><b class="num">' + (s.kwh_billed != null ? s.kwh_billed : '—') + '</b><span>kWh at meter</span></div>' +
       '<div><b class="num">' + (s.avg_kw != null ? s.avg_kw : '—') + '</b><span>avg kW</span></div>' +
       '<div><b class="num">' + (s.peak_kw != null ? s.peak_kw : '—') + '</b><span>peak kW</span></div>' +
     '</div>' +
-    '<div class="crange">' + s.soc0 + '% → ' + s.soc1 + '% · ' + s.kwh + ' kWh into battery' +
-      (s.kwh_billed != null ? ' (~' + s.kwh_billed + ' billed)' : '') +
+    '<div class="crange">' + s.soc0 + '% → ' + s.soc1 + '% · ' + s.kwh_billed + ' kWh at the meter' +
+      ' (' + s.kwh + ' into battery)' +
       (s.cost != null ? ' · ' + cur + Number(s.cost).toLocaleString() : '') + '</div></div>' : '';
   let top;
   if(c.active){
@@ -1937,21 +1937,21 @@ function renderChg(){
   } else {
     const last = (c.history || [])[0];
     top = '<div class="panel"><div class="plbl">Not charging</div>' +
-      (last ? '<div class="pval num">' + last.kwh + '<span class="u">kWh last session</span></div>' +
+      (last ? '<div class="pval num">' + last.kwh_billed + '<span class="u">kWh last session</span></div>' +
         '<div class="stats"><div><b>' + last.dt + '</b><span>finished</span></div>' +
         '<div><b class="num">' + last.soc0 + '→' + last.soc1 + '%</b><span>SoC</span></div>' +
         '<div><b class="num">' + last.avg_kw + ' kW</b><span>avg</span></div></div>'
       : '<div class="pval num">—</div>') + '</div>';
   }
   const hist = (c.history || []).map(x =>
-    '<div class="hrow2"><span>' + x.dt + '</span><span><b class="num">' + x.kwh + ' kWh</b> · ' +
+    '<div class="hrow2"><span>' + x.dt + '</span><span><b class="num">' + x.kwh_billed + ' kWh</b> · ' +
     x.dur_min + ' min · ' + cur + Number(x.cost).toLocaleString() + '</span></div>').join('');
   const calc = '<div class="rowcard" style="margin-top:var(--s3)">' +
     row('plug', 'Charge calculator', 'Cost to a target %', '', 'plan') + '</div>';
   el.innerHTML = top + calc + '<div id="chgSet"></div>' + curveHtml +
     sech('This month') +
     '<div class="panel"><div class="stats" style="border-top:0;padding-top:0;margin-top:0">' +
-      '<div><b class="num">' + (c.month_kwh || 0) + '</b><span>kWh in</span></div>' +
+      '<div><b class="num">' + (c.month_kwh_billed || 0) + '</b><span>kWh at meter</span></div>' +
       '<div><b class="num">' + (c.month || 0) + '</b><span>sessions</span></div>' +
       '<div><b class="num">' + cur + Number(c.month_cost || 0).toLocaleString() + '</b><span>cost</span></div>' +
       '</div></div>' +
@@ -2036,8 +2036,8 @@ function calDay(x, cy, cm){
       '<span class="rv">' + t.km + ' km</span></div>';
   });
   (x.charges || []).forEach(c => {
-    h += '<div class="row"><span class="rl">Charged ' + c.at + ' · +' + c.kwh + ' kWh<small>' +
-      c.soc0 + '% → ' + c.soc1 + '% · ' + c.min + ' min · avg ' + c.avg_kw + ' kW</small></span>' +
+    h += '<div class="row"><span class="rl">Charged ' + c.at + ' · ' + c.kwh_billed + ' kWh at the meter<small>' +
+      c.kwh + ' kWh into battery · ' + c.soc0 + '% → ' + c.soc1 + '% · ' + c.min + ' min · avg ' + c.avg_kw + ' kW</small></span>' +
       '<span class="rv">' + money(c.cost) + '</span></div>';
   });
   if(!(x.trips || []).length && !(x.charges || []).length)
@@ -2091,7 +2091,7 @@ async function renderDist(){
   const per = t.days_driven ? Math.round(t.km / t.days_driven) : null;
   el.insertAdjacentHTML('beforeend',
     '<div class="caltot">' + calStat(t.km || 0, 'km driven') + calStat(t.kwh || 0, 'kWh used') +
-      calStat(t.chg_kwh || 0, 'kWh charged') + '</div>' +
+      calStat(t.chg_kwh_billed || 0, 'kWh charged') + '</div>' +
     '<div class="caltot mid">' + calStat(t.eff != null ? t.eff : '—', 'kWh/100km') +
       calStat(t.chg_cost ? money(t.chg_cost) : '—', 'charging cost') +
       calStat(per != null ? per : '—', 'km per driving day') + '</div>' +

@@ -737,7 +737,7 @@
       <svg id="chgSvg" viewBox="0 0 400 160" width="100%" style="height:auto"></svg>
       <div class="chgstats">
         <div><b id="csDur">&mdash;</b><span>duration</span></div>
-        <div><b id="csKwh">&mdash;</b><span>kWh in</span></div>
+        <div><b id="csKwh">&mdash;</b><span>kWh at meter</span></div>
         <div><b id="csAvg">&mdash;</b><span>avg kW</span></div>
         <div><b id="csPeak">&mdash;</b><span>peak kW</span></div>
       </div>
@@ -874,7 +874,7 @@ const MAP_ID={
   "Into battery":"Masuk baterai","Buy at meter":"Beli di meteran","Range +km":"Tambah jangkauan",
   "Odometer":"Odometer","12V Battery":"Aki 12V","Avg speed":"Kecepatan rata",
   "Charges / wk":"Isi / mgg","kWh / mo":"kWh / bln","Rp / mo":"Rp / bln",
-  "duration":"durasi","kWh in":"kWh masuk","avg kW":"rata kW","peak kW":"puncak kW","kW charging now":"kW mengisi kini",
+  "duration":"durasi","kWh in":"kWh masuk","kWh at meter":"kWh di meteran","avg kW":"rata kW","peak kW":"puncak kW","kW charging now":"kW mengisi kini",
   "Front L":"Depan Ki","Front R":"Depan Ka","Rear L":"Belakang Ki","Rear R":"Belakang Ka",
   "Home":"Beranda","Charge":"Isi","Trips":"Jalan","More":"Lainnya",
   "Control":"Kontrol","Lock":"Kunci","Unlock":"Buka kunci","A/C on":"AC nyala","A/C off":"AC mati",
@@ -991,7 +991,7 @@ async function loadCal(){ const key=calMonth;
 function renderCal(d){ const [y,m]=d.month.split('-').map(Number);
   $('calTitle').textContent=new Date(y,m-1,1).toLocaleDateString(lang==='id'?'id-ID':'en-US',{month:'long',year:'numeric'});
   const t=d.totals;
-  $('calTot').textContent=fmt(t.km)+' km · '+t.kwh+' kWh'+(t.chg_kwh?' · ⚡ '+t.chg_kwh+' kWh · '+money(t.chg_cost):'');
+  $('calTot').textContent=fmt(t.km)+' km · '+t.kwh+' kWh'+(t.chg_kwh?' · ⚡ '+t.chg_kwh_billed+' kWh · '+money(t.chg_cost):'');
   $('calCap').textContent=T('Tap a day for its km, energy and charging.');
   const g=$('calGrid'); g.replaceChildren();
   const lead=(new Date(y,m-1,1).getDay()+6)%7;              // Monday-first
@@ -1018,7 +1018,8 @@ function bCalDay(x,month){ const [y,m]=month.split('-').map(Number);
       x.km?[measured?tn('Energy used','Energi dipakai'):tn('Energy (est.)','Energi (estimasi)'), (measured?kwh:kwh.toFixed(1))+' kWh']:null,
       measured?[tn('Efficiency','Efisiensi'), x.eff+' kWh/100km']:null,
       cost!=null?[tn('Cost (est.)','Biaya (estimasi)'), rp(cost)]:null,
-      x.chg_kwh?[tn('Charged','Diisi'), x.chg_kwh+' kWh · '+money(x.chg_cost)]:null],
+      x.chg_kwh?[tn('Charged (meter)','Diisi (meteran)'), x.chg_kwh_billed+' kWh · '+money(x.chg_cost)]:null,
+      x.chg_kwh?[tn('Into the pack','Masuk baterai'), x.chg_kwh+' kWh']:null],
     note: x.km&&!measured? tn('SoC too coarse to measure this short a day.','SoC terlalu kasar untuk hari sependek ini.'):null };
 }
 $('themeSeg').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; theme=b.dataset.v; try{localStorage.setItem('theme',theme)}catch(e){} applyTheme(); syncSeg(); buzz(8); });
@@ -1407,7 +1408,8 @@ function bCharge(){ const c=DATA.charging||{};
     lead: c.active?tn('Charging right now.','Sedang mengisi sekarang.'):tn('Your charging habit and cost.','Kebiasaan dan biaya pengisian kamu.'),
     rows:[ c.active?[tn('Charging now','Mengisi kini'), (c.rate_kw!=null?c.rate_kw:'—')+' kW']:null,
       [tn('Charges / week','Isi / minggu'), c.week!=null?c.week:'—'],
-      [tn('kWh this month','kWh bulan ini'), c.month_kwh!=null?c.month_kwh:'—'],
+      [tn('kWh this month (meter)','kWh bulan ini (meteran)'), c.month_kwh_billed!=null?c.month_kwh_billed:'—'],
+      [tn('Into the pack','Masuk baterai'), c.month_kwh!=null?c.month_kwh+' kWh':'—'],
       [tn('Cost this month','Biaya bulan ini'), c.month_cost?curSym()+' '+kfmt(c.month_cost):curSym()+' 0']],
     note:tn(`Cost bills delivered (meter) kWh, not what reaches the pack — matched to your real SPKLU receipts within ~1%. Open the charge curve for a session-by-session breakdown.`,
       `Biaya menagih kWh terkirim (meteran), bukan yang masuk baterai — cocok dengan struk SPKLU nyata kamu dalam ~1%. Buka kurva pengisian untuk rincian per sesi.`)};
@@ -1901,9 +1903,9 @@ async function load(live){
   const c=d.charging||{};
   $('chgActive').style.display = c.active?'block':'none';
   const cb=$('chgbadge'); cb.textContent=T(c.active?'Active':'Idle'); cb.className='badge '+(c.active?'ok':'idle');
-  if(c.active){ roll('chgrate', c.rate_kw!=null?c.rate_kw:'—'); roll('chgkwh', c.session_kwh); $('chgsoc').textContent=c.soc!=null?c.soc:'—'; $('chgleft').textContent=c.remaining_min!=null?c.remaining_min:'—'; }
+  if(c.active){ roll('chgrate', c.rate_kw!=null?c.rate_kw:'—'); roll('chgkwh', c.session_kwh_billed); $('chgsoc').textContent=c.soc!=null?c.soc:'—'; $('chgleft').textContent=c.remaining_min!=null?c.remaining_min:'—'; }
   $('chgWeek').textContent=c.week!=null?c.week:'—';
-  $('chgMonthKwh').textContent=c.month_kwh!=null?c.month_kwh:'—';
+  $('chgMonthKwh').textContent=c.month_kwh_billed!=null?c.month_kwh_billed:'—';
   $('chgMonthCost').textContent = c.month_cost? (Math.round(c.month_cost/1000)+'k') : '0';
   const s=c.session;
   $('chgToggle').style.display = s?'flex':'none';
@@ -1911,11 +1913,11 @@ async function load(live){
     $('chgToggleLbl').textContent = s.ongoing? T('Charge curve')+' · '+T('live') : T('Last charge')+' · '+s.start_dt;
     drawCharge(s);
     $('csDur').textContent=(s.dur_min!=null?s.dur_min:'—')+'m';
-    $('csKwh').textContent=s.kwh!=null?s.kwh:'—';
+    $('csKwh').textContent=s.kwh_billed!=null?s.kwh_billed:'—';
     $('csAvg').textContent=s.avg_kw!=null?s.avg_kw:'—';
     $('csPeak').textContent=s.peak_kw!=null?s.peak_kw:'—';
-    $('csRange').textContent = s.soc0+'% → '+s.soc1+'% · '+s.kwh+' kWh '+tn('into battery','masuk baterai')
-      + (s.kwh_billed!=null?' (~'+s.kwh_billed+' '+tn('billed','tertagih')+')':'') + (s.cost!=null?' · '+money(s.cost):'');
+    $('csRange').textContent = s.soc0+'% → '+s.soc1+'% · '+s.kwh_billed+' kWh '+tn('at the meter','di meteran')
+      + ' ('+s.kwh+' '+tn('into battery','masuk baterai')+')' + (s.cost!=null?' · '+money(s.cost):'');
     const hh=$('chgHist'); hh.replaceChildren();
     (c.history||[]).forEach(h=>{ const r=document.createElement('div'); r.className='hrow';
       const kw = h.kwh_billed!=null? h.kwh_billed : h.kwh;
