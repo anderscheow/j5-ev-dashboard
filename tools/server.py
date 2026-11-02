@@ -78,6 +78,8 @@ _poll_lock = threading.Lock()
 def live_poll():
     """On-demand: poll the car's WebSocket right now and store the frame.
     Returns (ok, msg). Single-flight via lock so rapid taps don't stack WS connections."""
+    if REPLICA_OF:                 # a mirror records nothing of its own: see tools/replica.py
+        return False, "mirror"
     if not _poll_lock.acquire(blocking=False):
         return False, "busy"
     try:
@@ -106,6 +108,15 @@ PUSH_DB = os.path.join(_DATA, "push_alerts.db")
 MAINT_DB = (os.path.join(tempfile.mkdtemp(prefix="carlinko-demo-"), "maintenance.db") if DEMO
             else os.path.join(_DATA, "maintenance.db"))
 WEB  = os.path.join(HERE, "..", "web")
+# Fork operations: staging mirrors production (tools/replica.py). Production serves the
+# /api/replica/* routes only while CARLINKO_REPLICA_TOKEN is set; a mirror sets
+# CARLINKO_REPLICA_OF to production's URL and then never polls the car itself.
+REPLICA_TOKEN = os.environ.get("CARLINKO_REPLICA_TOKEN", "")
+REPLICA_OF = os.environ.get("CARLINKO_REPLICA_OF", "").rstrip("/")
+# The owner's own files a mirror copies. Never push_alerts.db (a mirror must not send
+# alerts), creds.json or token.txt (it must not hold production's CarLinko session).
+REPLICA_FILES = ("maintenance.db", "prices.db", "car-photo.img")
+REPLICA_PAGE_MAX = 5000
 
 def _creds():
     try:
@@ -1856,6 +1867,47 @@ def month_history(month):
                        "regen": round(sum(x["regen"] for x in days), 1)},
             "resync_km": "skip" if resync_skip else "count"}
 
+# ---- mirror source: what a staging dashboard pulls from production (tools/replica.py) ----
+
+def replica_telemetry(after, limit):
+    """Up to `limit` telemetry rows newer than `after`, oldest first, with the table's own
+    schema and column names so a mirror can create the table and insert by name."""
+    conn = db_connect()
+    try:
+        schema = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                              "AND name='telemetry'").fetchone()
+        if schema is None:
+            return {"schema": None, "columns": [], "rows": [], "more": False}
+        cur = conn.execute("SELECT * FROM telemetry WHERE ts > ? ORDER BY ts LIMIT ?",
+                           (after, limit + 1))
+        columns = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"schema": schema[0], "columns": columns, "rows": rows[:limit],
+            "more": len(rows) > limit}
+
+def replica_file(name):
+    """(bytes, sha256) of one of REPLICA_FILES, or None when this dashboard has none. A SQLite
+    file is read through the backup API, so a write in flight never yields a torn copy."""
+    path = os.path.join(_DATA, name)
+    if not os.path.exists(path):
+        return None
+    if name.endswith(".db"):
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = os.path.join(tmp, name)
+            src, dst = sqlite3.connect(path, timeout=15), sqlite3.connect(copy)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close(); src.close()
+            with open(copy, "rb") as f:
+                data = f.read()
+    else:
+        with open(path, "rb") as f:
+            data = f.read()
+    return data, hashlib.sha256(data).hexdigest()
+
 # ---- long-trip planner: geocode (Nominatim) + route (OSRM) + SPKLU (Overpass/OSM), all keyless ----
 _UA_TRIP = "carlinko-trip/1.0 (personal EV dashboard)"
 CHG_KW_AVG = 55           # fallback DC power when a station's kW is unknown (incl taper)
@@ -2302,8 +2354,45 @@ class H(BaseHTTPRequestHandler):
     # paths reachable without a session (so the login/unlock page can load + submit)
     _PUBLIC = {"/login.html", "/icon.svg", "/manifest.webmanifest", "/api/status", "/api/login", "/api/unlock"}
 
+    def _replica(self, path):
+        """GET /api/replica/telemetry?after=&limit= and /api/replica/files/{name}: what a
+        mirror pulls. None of it exists without CARLINKO_REPLICA_TOKEN, and none of it answers
+        to a dashboard session -- the token, compared in constant time, is the only key."""
+        if len(REPLICA_TOKEN) < 32:
+            self._send(404, b'{"error":"not found"}', "application/json"); return
+        auth = self.headers.get("Authorization") or ""
+        given = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        if not hmac.compare_digest(given.encode(), REPLICA_TOKEN.encode()):
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        files = "/api/replica/files/"
+        try:
+            if path == "/api/replica/telemetry":
+                after = int((q.get("after") or ["0"])[0])
+                limit = max(1, min(REPLICA_PAGE_MAX,
+                                   int((q.get("limit") or [str(REPLICA_PAGE_MAX)])[0])))
+                self._send(200, json.dumps(replica_telemetry(after, limit)).encode(),
+                           "application/json")
+            elif path.startswith(files) and path[len(files):] in REPLICA_FILES:
+                found = replica_file(path[len(files):])
+                if found is None:                      # the mirror keeps its own
+                    self._send(404, b'{"error":"absent"}', "application/json"); return
+                data, digest = found
+                if self.headers.get("If-None-Match") == digest:
+                    self._send(304, b"", "application/octet-stream", {"ETag": digest}); return
+                self._send(200, data, "application/octet-stream", {"ETag": digest})
+            else:
+                self._send(404, b'{"error":"not found"}', "application/json")
+        except (ValueError, TypeError):
+            self._send(400, b'{"error":"bad request"}', "application/json")
+        except Exception as e:
+            _log_exception("GET %s failed" % path, e)
+            self._send(500, b'{"error":"replica source unavailable"}', "application/json")
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path.startswith("/api/replica/"):           # token-only; checked before the gate
+            self._replica(path); return
         if path == "/api/status":
             self._send(200, json.dumps({"configured": is_configured(), "gated": _gated(),
                                         "authed": self._authed(),

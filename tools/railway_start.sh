@@ -22,12 +22,19 @@ elif [ ! -f "$DATA/creds.json" ]; then
   echo "railway_start: WARNING — no CREDS_JSON variable and no $DATA/creds.json in the volume" >&2
 fi
 
-# Restarted like the dispatcher below: a logger that dies leaves the dashboard serving an
-# ever-older last frame with no error anywhere, so it must not stay dead until the next deploy.
-(while true; do python logger.py --adaptive; echo "railway_start: logger exited; restarting in 15 s" >&2; sleep 15; done) &
-if [ "${VOLTMOSS_PUSH_DISPATCHER:-0}" = "1" ]; then
-  # Restarted like tools/run.py does: a dead dispatcher only withdraws push_alerts from
-  # /api/status, which is safe but silent, so it must not stay dead until the next deploy.
-  (while true; do python push_dispatcher.py; echo "railway_start: push dispatcher exited; restarting in 15 s" >&2; sleep 15; done) &
+if [ -n "$CARLINKO_REPLICA_OF" ]; then
+  # A mirror (staging) never talks to the car or sends alerts: CarLinko allows one live session
+  # per account, and production holds it. replica.py pulls what production recorded instead.
+  echo "railway_start: mirror of $CARLINKO_REPLICA_OF -- no logger, no push dispatcher"
+  (while true; do python replica.py; echo "railway_start: replica exited; restarting in 15 s" >&2; sleep 15; done) &
+else
+  # Restarted like the dispatcher below: a logger that dies leaves the dashboard serving an
+  # ever-older last frame with no error anywhere, so it must not stay dead until the next deploy.
+  (while true; do python logger.py --adaptive; echo "railway_start: logger exited; restarting in 15 s" >&2; sleep 15; done) &
+  if [ "${VOLTMOSS_PUSH_DISPATCHER:-0}" = "1" ]; then
+    # Restarted like tools/run.py does: a dead dispatcher only withdraws push_alerts from
+    # /api/status, which is safe but silent, so it must not stay dead until the next deploy.
+    (while true; do python push_dispatcher.py; echo "railway_start: push dispatcher exited; restarting in 15 s" >&2; sleep 15; done) &
+  fi
 fi
 exec python server.py "${PORT:-8088}"
