@@ -19,3 +19,18 @@
   Service records, receipt images and the guide's market and model choice are
   kept in `maintenance.db` in the data directory, so a reinstalled or second
   client sees the same log. Demo mode keeps a scratch copy per process.
+- Added the price book behind the new `price_book` capability: dated charging
+  prices (all, AC or DC) and fuel prices, and per-session overrides (a price per
+  kWh, a receipt's total with its metered kWh, or free). `GET`/`PUT /api/prices`,
+  `GET /api/charges?month=`, `PUT`/`DELETE /api/charges/{id}/price` and
+  `POST /api/charges/prices`; stored in `prices.db` in the data directory.
+  Every session, `charging.month_cost`, `lifetime.cost`, `/api/history` cost and
+  trip-planner stop is priced from it, falling back to `creds.json`. Sessions now
+  carry `id`, `type`, `price` and `price_source`; the summary adds
+  `insights.price_basis`, `lifetime.petrol_cost` and `fuel_price`. No
+  `api_version` bump: with no price book every cost is unchanged.
+- `insights.rp_per_km` (and `month_cost_est`) now uses what charging actually
+  cost over the last 90 days when at least 20 kWh went in, and `lifetime.saved`
+  is the petrol those km would have cost less the actual charging spend. Both
+  move on existing installs even with no price book; see `docs/api-map.md`.
+  Demo mode does not offer the price book.

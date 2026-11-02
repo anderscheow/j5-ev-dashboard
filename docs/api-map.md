@@ -165,7 +165,7 @@ evaluator sends the event with no value in that case (`push_evaluator.VOLT12_LOW
 ```json
 {
   "api_version": 2,
-  "capabilities": ["settings_read", "target_soc", "charge_schedule", "scheduled_travel", "vehicle_alerts", "climate_settings", "climate_seats", "maintenance_guide", "service_centres", "maintenance_records"]
+  "capabilities": ["settings_read", "target_soc", "charge_schedule", "scheduled_travel", "vehicle_alerts", "climate_settings", "climate_seats", "maintenance_guide", "service_centres", "maintenance_records", "price_book"]
 }
 ```
 
@@ -179,7 +179,7 @@ that their CarLinko account has permission, or that a vendor request will succee
 still inspect vehicle control caps and operation results. Demo mode reports only
 `maintenance_guide`, `service_centres` and `maintenance_records`, which it
 implements (the log in a scratch directory that goes with the process); its
-account settings remain unavailable.
+account settings remain unavailable, and so is the price book (its routes answer 404).
 
 | ID | Server behavior |
 |---|---|
@@ -196,6 +196,7 @@ account settings remain unavailable.
 | `maintenance_guide` | `GET /api/maintenance-guide` returns the country and model timetable, completed milestones, and next due service. |
 | `service_centres` | `GET /api/service-centres` returns nearby brand service centres and an official locator link for the supplied coordinates. |
 | `maintenance_records` | The owner's maintenance log, kept by the dashboard rather than any one client — see *Maintenance log* below. |
+| `price_book` | Dated charging and fuel prices and per-session price overrides, which price every session, summary and insight — see *Price book* below. |
 
 ### Maintenance log — `maintenance_records`
 
@@ -223,6 +224,55 @@ means version 0, as on `/api/summary`. Clients should ignore IDs
 they do not know and use feature-specific errors if a claimed operation fails. Adding a new
 capability ID is additive and does not bump `api_version`; a breaking `/api/summary` shape change
 does. A release must record any new IDs in this table.
+
+### Price book — `price_book`
+
+One `tariff` and one `petrol_price` in `creds.json` used to price every session ever logged, so a
+price change rewrote history and a pump price that moves weekly was right for one week at most.
+The price book dates them. It lives in `prices.db` beside the telemetry database (`tools/pricing.py`),
+so every client sees the same prices; `creds.json` still prices whatever it does not cover, and a
+dashboard nobody has priced reports exactly what it did before. Every route needs a session when
+the dashboard is gated; demo mode answers 404.
+
+| Route | Behavior |
+|---|---|
+| `GET /api/prices` | `{charge, fuel, fuel_kml, currency, defaults}`. `charge`: `[{scope, start, price, label}]`, `scope` `all`/`ac`/`dc`. `fuel`: `[{start, price, label}]`. `start` is a `YYYY-MM-DD` the price took effect (local midnight); `price` is per billed kWh or per litre in `currency`. `fuel_kml` is the petrol car savings are measured against, null when unset. `defaults` are the `creds.json` `tariff`, `fuel` and `fuel_kml` used where the book is silent. |
+| `PUT /api/prices` | Any of `charge`, `fuel` (each **replaces that whole list**; `[]` clears it) and `fuel_kml` (null clears). A part left out is untouched. Answers what `GET` would. |
+| `GET /api/charges?month=YYYY-MM` | Every charge session that month, drawn exactly as `/api/history` draws them: `{month, currency, sessions, orphans, totals}`. A session: `id`, `start`/`end` (local `YYYY-MM-DD HH:MM`), `type` (`ac`/`dc`), `kwh` (into the pack), `kwh_billed`, `soc0`, `soc1`, `dur_min`, `avg_kw`, `price` (per billed kWh), `price_source` (`override`/`period`/`default`), `period` (`{scope, start, label}` or null), `override` (or null), `cost`. `orphans`: `[{id, start, override}]` — overrides keyed this month that no session carries. |
+| `PUT /api/charges/{id}/price` | Pins one session: `{mode, value?, metered_kwh?, note?}`. `mode` `rate` (`value` per billed kWh), `total` (`value` is the receipt's bottom line) or `free`. `metered_kwh` is the receipt's kWh, which replaces the estimate. Replaces anything the session carried. 404 when no session covers `id`. |
+| `DELETE /api/charges/{id}/price` | The session goes back to its period or the tariff. An orphan is cleared by its own `id`. |
+| `POST /api/charges/prices` | `{ids, price}` pins up to 500 sessions to one price, `{ids, clear: true}` clears them. Every ID must find its session, or nothing is written (404). |
+
+Bad input is a 400 with `{error}` before anything is written.
+
+**How a session is priced.** A charge session takes its own override; else the newest period of
+its own type (`ac`/`dc`) that had started by its day; else the newest `all` period; else the
+`creds.json` tariff. The type comes from the connector byte the car reported while the SoC rose
+(b56: 1 = AC, 16 = DC), or, where the car reported none, from the session's average power (above
+12 kW is DC). Billed kWh is the receipt's when an override gave it, else the kWh into the pack
+over the charge efficiency, as before.
+
+**Session IDs.** Sessions are not stored; the server re-derives them from telemetry on every
+request. A session's `id` is the unix second it reported the session starting, and an override is
+matched back to the session whose window — from 10 minutes before its start to its last SoC rise
+— holds that key, nearest the start. A detector change that shifts a start by a frame keeps its
+override; one that no longer lands anywhere is listed in `orphans` instead of pricing nothing.
+
+**What it changes elsewhere.** No `api_version` bump: every existing field keeps its type, units
+and meaning, and a dashboard with no price book reports the same costs as before.
+
+| Field | Now |
+|---|---|
+| `charging.month_cost`, `charging.history[].cost`, `charging.session.cost`, `lifetime.cost`, `/api/history` `chg_cost` and `charges[].cost` | Each session priced as above. |
+| `charging.history[]`, `charging.session`, `/api/history` `charges[]` | Also carry `id`, `type`, `price` and `price_source` (additive). |
+| `kwh_billed`, `lifetime.kwh_billed`, `health.charged_kwh`, `health.avg_eff` | Use the receipt's kWh where an override gave one. |
+| `tariff` | Still what an unpriced DC charge costs today — now from the book's DC (then `all`) period before `creds.json`. |
+| `insights.rp_per_km`, `month_cost_est` | Consumption × what charging actually cost per kWh into the pack over the last 90 days (at least 20 kWh of it); without that much, today's DC price over the average efficiency, as before. `insights.price_basis` (additive) says which: `{basis: "paid", per_kwh, sessions, days}` or `{basis: "tariff", per_kwh}`. |
+| `insights.save_per_km`, `month_save_est` | Against today's fuel price and the book's `fuel_kml`. |
+| `lifetime.saved` | The petrol those km would have cost — each stretch of odometer at the fuel price of its day — **less what charging actually cost**. Before the first logged charge, the running cost per km stands in for that spend. It used to be km × (petrol per km − running cost per km), so an existing install's figure moves even with no price book. |
+| `lifetime.petrol_cost`, `fuel_price` (`{per_l, kml, source}`) | New (additive): the petrol-car cost above, and today's fuel price and economy. |
+| `lifetime.liters_saved`, `co2_saved` | Over the book's `fuel_kml`. |
+| `/api/trip` stop `cost` | Today's DC price. |
 
 ### Voltmoss push binding (optional)
 

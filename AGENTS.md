@@ -27,8 +27,17 @@ until it is merged. The maintainer release procedure is in
 intended server code. Run `python3 tools/ci_check.py`,
 `python3 tools/status_selftest.py`, `python3 tools/release_selftest.py`,
 `python3 tools/push_contract_selftest.py`,
-`python3 tools/push_dispatcher_selftest.py`, and
+`python3 tools/push_dispatcher_selftest.py`, `python3 tools/pricing_selftest.py`, and
 `python3 -m unittest push_relay.test_relay` before tagging.
+
+The price book (`tools/pricing.py`, capability `price_book`) prices every
+charge session, summary cost and insight from the owner's dated prices and
+per-session overrides. It is fork-only, like `push_relay/`: keep it out of
+upstream PRs, and keep its footprint in `server.py` to the call sites that
+price something, so upstream syncs stay mergeable. Any new figure that costs
+something must take its price from `_book()`, never from `TARIFF_IDR` or
+`PETROL_RP_L` directly, or it will disagree with `/api/charges`. The contract
+is in `docs/api-map.md` → "Price book".
 
 Voltmoss push alerts (`push_alerts`) are opt-in per deployment and off by
 default. The dispatcher evaluates committed telemetry, never `GET

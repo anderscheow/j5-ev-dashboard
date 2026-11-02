@@ -6,6 +6,9 @@ carlinko.db
 # the owner's maintenance log and receipt photos (tools/ when run without CARLINKO_DATA)
 maintenance.db
 tools/maintenance.db
+# the owner's price book: dated prices and per-session overrides (same rule)
+prices.db
+tools/prices.db
 .playwright-mcp/
 dash-*.png
 token.txt

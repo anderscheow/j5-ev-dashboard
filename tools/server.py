@@ -6,11 +6,13 @@ import os, sys, json, time, sqlite3, threading, math, calendar, copy, tempfile, 
 import logging, traceback
 from collections import deque
 import hmac, hashlib, base64, secrets, re
+from bisect import bisect_left, bisect_right
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import known_cars          # per-model constants the telemetry never carries (pack size, tyre scale)
 import log_setup
 import maintenance
 import maintenance_records as maint
+import pricing
 
 log_setup.configure()
 LOG = logging.getLogger("carlinko.server")
@@ -46,6 +48,7 @@ CAPABILITIES = (
     "maintenance_guide",
     "service_centres",
     "maintenance_records",
+    "price_book",
 )
 
 # The operator explicitly enables the relay and asserts this dashboard is
@@ -105,6 +108,10 @@ PUSH_DB = os.path.join(_DATA, "push_alerts.db")
 # visitor's test records never land beside the code and vanish with the process.
 MAINT_DB = (os.path.join(tempfile.mkdtemp(prefix="carlinko-demo-"), "maintenance.db") if DEMO
             else os.path.join(_DATA, "maintenance.db"))
+# The owner's price book (pricing.py). Demo mode neither reads nor advertises it, but keeps any
+# stray write in scratch for the same reason as the maintenance log.
+PRICE_DB = (os.path.join(tempfile.mkdtemp(prefix="carlinko-demo-"), "prices.db") if DEMO
+            else os.path.join(_DATA, "prices.db"))
 WEB  = os.path.join(HERE, "..", "web")
 
 def _creds():
@@ -779,6 +786,8 @@ MAX_CHG_KW = 150        # no charge on this platform exceeds ~68 kW DC. A single
                         # dark mid-charge and dumped the whole SoC gain in one frame on reconnect
                         # (same failure as ODO_RESYNC_KM for driving). Its timespan is a measurement
                         # artifact, so avg/peak kW from it are fiction -> drop the session.
+AC_MAX_KW = 12          # no onboard AC charger on these platforms passes 11 kW: an untagged session
+                        # averaging more than this was on DC
 _TARIFF = float(TARIFF_IDR_CFG or 2540)   # all-in DC tariff/kWh, in CUR_CODE (IDR default: Rp2.467 + 3% tax; service Rp0)
 TARIFF_IDR = int(_TARIFF) if _TARIFF == int(_TARIFF) else _TARIFF  # keep cents for decimal currencies (e.g. ZAR 3.10)
 CHG_EFF_AVG = 0.89      # blended DC charge efficiency for the per-km cost insight
@@ -1045,6 +1054,38 @@ def build_sessions(fr, now):
                     "pts": pts, "ongoing": ongoing})
     return out
 
+def type_sessions(sessions, data):
+    """Tags each session "ac" or "dc": by the connector byte the car reported while its SoC rose
+    (b56: 1 = AC, 16 = DC), else by its average power. A home wallbox and a highway DC stop are
+    priced apart, so the type decides which price period applies."""
+    modes = [(ts, d["charge_mode"]) for ts, _dt, d in data if d.get("charge_mode") in (1, 16)]
+    stamps = [ts for ts, _mode in modes]
+    for s in sessions:
+        seen = [mode for _ts, mode in modes[bisect_left(stamps, s["start"]):
+                                            bisect_right(stamps, s["end"])]]
+        if seen:
+            s["type"] = "dc" if seen.count(16) >= seen.count(1) else "ac"
+        else:
+            s["type"] = "dc" if s["avg"] > AC_MAX_KW else "ac"
+
+def _book():
+    """The owner's price book (pricing.py) over creds.json's tariff and petrol price, which
+    still price anything no period covers. A price book that cannot be read prices everything
+    from creds.json rather than taking the summary down with it."""
+    try:
+        return pricing.load(PRICE_DB, TARIFF_IDR, PETROL_RP_L, PETROL_KM_L)
+    except sqlite3.Error as e:
+        _log_exception("price book unreadable, pricing from creds.json", e)
+        return pricing.PriceBook({}, [], TARIFF_IDR, PETROL_RP_L, PETROL_KM_L)
+
+def priced_sessions(data, fr, now, book):
+    """build_sessions() over `fr`, each session typed from `data` and priced from `book` --
+    what summary(), month_history() and /api/charges all report, so the three agree."""
+    sess = build_sessions(fr, now)
+    type_sessions(sess, data)
+    book.price_sessions(sess, chg_eff)
+    return sess
+
 def live_rate(pts):
     """Charging speed over the last 15 min of the session (kW)."""
     ref = pts[-1][0]; w = [p for p in pts if p[0] >= ref - 900]
@@ -1061,11 +1102,19 @@ def session_detail(s):
             "dur_min": round((s["end"] - s["start"]) / 60), "kwh": round(s["kwh"], 2),
             "soc0": s["soc0"], "soc1": s["soc1"], "avg_kw": round(s["avg"], 1),
             "peak_kw": round(s["peak"], 1) if s["peak"] else None,
-            "kwh_billed": round(s["kwh"] / chg_eff(s["soc1"]), 1),  # metered (what you pay for)
-            "cost": round(s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR), "series": series}
+            "kwh_billed": round(s["billed"], 1),        # metered (what you pay for)
+            "cost": round(s["cost"]), **session_price(s), "series": series}
 
-def analyze(data, trips, kwh_day):
-    """Energy/efficiency from SoC%+odometer; charging sessions from parked SoC-rise.
+def session_price(s):
+    """How a priced session was priced, for every list that shows one: its ID (the start the
+    server reported, which a price override is keyed by), AC or DC, the price per billed kWh and
+    whether that came from an override, a dated period or creds.json's tariff."""
+    return {"id": s["start"], "type": s.get("type"), "price": pricing.num(_m(s["price"])),
+            "price_source": s["price_source"]}
+
+def analyze(data, trips, kwh_day, book):
+    """Energy/efficiency from SoC%+odometer; charging sessions from parked SoC-rise, priced from
+    the owner's price `book`.
     Today/this-week km come from build_trips(), each trip bucketed by the day it STARTED -- a
     drive that crosses midnight stays one trip on the day it began. Energy comes from
     day_energy() (every observed SoC drop, parked drops included), so "used today" matches the
@@ -1089,7 +1138,7 @@ def analyze(data, trips, kwh_day):
     used_week = sum(v for k, v in kwh_day.items()
                     if time.strftime("%Y-W%W", time.strptime(k, "%Y-%m-%d")) == week)
     now = time.time()
-    sess = build_sessions(fr, now)
+    sess = priced_sessions(data, fr, now, book)
     for s in sess:
         if time.strftime("%Y-W%W", time.localtime(s["start"])) == week:
             out["charging"]["week"] += 1; out["charging"]["week_kwh"] += s["kwh"]
@@ -1098,28 +1147,31 @@ def analyze(data, trips, kwh_day):
     out["charging"]["week_kwh"] = round(out["charging"]["week_kwh"], 1)
     out["charging"]["month_kwh"] = round(out["charging"]["month_kwh"], 1)
     out["charging"]["month_cost"] = round(sum(
-        s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR for s in sess
-        if time.strftime("%Y-%m", time.localtime(s["start"])) == month))
+        s["cost"] for s in sess if time.strftime("%Y-%m", time.localtime(s["start"])) == month))
     out["charging"]["history"] = [                     # recent finished/ongoing sessions, newest first
         {"dt": time.strftime("%d %b %H:%M", time.localtime(s["start"])),
-         "kwh": round(s["kwh"], 1), "kwh_billed": round(s["kwh"] / chg_eff(s["soc1"]), 1),
+         "kwh": round(s["kwh"], 1), "kwh_billed": round(s["billed"], 1),
          "dur_min": round((s["end"] - s["start"]) / 60),
          "avg_kw": round(s["avg"], 1), "soc0": s["soc0"], "soc1": s["soc1"],
-         "cost": round(s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR)}
+         "cost": round(s["cost"]), **session_price(s)}
         for s in sess[::-1][:6] if s["kwh"] > 0.3]
     total_dsoc = sum(max(0, s["soc1"] - s["soc0"]) for s in sess)
     out["health"] = {
         "usable_kwh": CAP_KWH,                          # design usable; verified vs receipts (no SoH byte exists)
         "cycles": round(total_dsoc / 100.0, 1),         # equivalent full cycles seen since logging
-        "charged_kwh": round(sum(s["kwh"] / chg_eff(s["soc1"]) for s in sess), 1),  # delivered, lifetime-logged
-        "avg_eff": round(sum(chg_eff(s["soc1"]) for s in sess) / len(sess) * 100) if sess else None,
+        "charged_kwh": round(sum(s["billed"] for s in sess), 1),  # delivered, lifetime-logged
+        # pack kWh over metered kWh: the receipt's where the owner entered one, else chg_eff()
+        "avg_eff": round(sum(s["kwh"] / s["billed"] for s in sess) / len(sess) * 100) if sess else None,
         "sessions": len(sess)}
     out["lifetime"] = {                                # running totals since logging began
         "kwh_in": round(sum(s["kwh"] for s in sess), 1),                          # into the pack
-        "kwh_billed": round(sum(s["kwh"] / chg_eff(s["soc1"]) for s in sess), 1), # metered (paid for)
-        "cost": round(sum(s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR for s in sess)),
+        "kwh_billed": round(sum(s["billed"] for s in sess), 1),                   # metered (paid for)
+        "cost": round(sum(s["cost"] for s in sess)),
         "km": (fr[-1][2] - fr[0][2]) if len(fr) >= 2 else 0,                      # odometer span
-        "since": time.strftime("%d %b", time.localtime(fr[0][0])) if fr else None}
+        "since": time.strftime("%d %b", time.localtime(fr[0][0])) if fr else None,
+        # the same km in a petrol car, each stretch at the fuel price of its day
+        "petrol_cost": round(book.fuel_cost([(ts, odo) for ts, _soc, odo in fr]))}
+    out["paid"] = pricing.paid_average(sess, now)      # what charging actually cost lately
     # A 100% charge is what re-anchors an LFP BMS: the discharge curve is so flat that the gauge
     # drifts without one. Track the interval so the dashboard can say *when*, not just "overdue".
     full = [s for s in sess if s["soc1"] >= 100]
@@ -1193,18 +1245,32 @@ def parked_drain(data):
                 "dt": time.strftime("%d %b", time.localtime(ts1))}   # loop ascending -> ends newest
     return best
 
-def insights(out):
-    """Actionable read-only insights from the data: running cost, charge forecast, real range."""
+def insights(out, paid=None, book=None):
+    """Actionable read-only insights from the data: running cost, charge forecast, real range.
+
+    `paid` is pricing.paid_average() over the logged sessions: with it, a km costs what charging
+    has actually cost lately, home wallbox and highway DC mixed as the owner mixes them. Without
+    it -- too little charging logged, or demo mode -- today's price stands in. `book` supplies
+    today's prices; None is creds.json's."""
     ins = {}
     cons = (out["energy"].get("consumption") or out["energy"].get("week_consumption") or WLTP_KWH_100)
     ins["consumption"] = cons
-    rpkm = cons * TARIFF_IDR / 100.0 / CHG_EFF_AVG      # cost/km incl charging loss (you pay delivered)
+    today = time.strftime("%Y-%m-%d")
+    if paid:
+        rpkm = cons * paid["per_pack_kwh"] / 100.0      # cost per pack kWh already carries the loss
+        ins["price_basis"] = {"basis": "paid", "per_kwh": pricing.num(_m(paid["per_kwh"])),
+                              "sessions": paid["sessions"], "days": paid["days"]}
+    else:
+        tariff = book.charge_rate("dc", today)[0] if book else TARIFF_IDR
+        rpkm = cons * tariff / 100.0 / CHG_EFF_AVG      # cost/km incl charging loss (you pay delivered)
+        ins["price_basis"] = {"basis": "tariff", "per_kwh": pricing.num(tariff)}
     ins["rp_per_km"] = _m(rpkm)
     hist = out.get("history") or []
     avg_daily = (sum(h["km"] for h in hist) / len(hist)) if hist else 0.0
     ins["avg_daily_km"] = round(avg_daily)
     ins["month_cost_est"] = round(avg_daily * 30 * rpkm)
-    petrol_rpkm = PETROL_RP_L / PETROL_KM_L            # comparable ICE cost/km
+    petrol_rpkm = (book.fuel_rate(today)[0] / book.kml if book    # comparable ICE cost/km
+                   else PETROL_RP_L / PETROL_KM_L)
     ins["save_per_km"] = _m(petrol_rpkm - rpkm)
     ins["month_save_est"] = round(avg_daily * 30 * (petrol_rpkm - rpkm))
     rng, batt = out.get("range_km"), out.get("battery")
@@ -1574,10 +1640,11 @@ _summary_cache = None  # (inputs, time.monotonic() when computed, payload)
 def _summary_inputs():
     """Every file _summary() reads: the database, which the logger and a live poll commit
     frames to (and its WAL log: db_connect() runs it in WAL mode, so a commit may touch only that
-    file until a checkpoint), and creds.json, which carries the
-    vehicle identity, the photo override and the re-sync setting."""
+    file until a checkpoint), creds.json, which carries the
+    vehicle identity, the photo override and the re-sync setting, and the price book, which
+    prices every session."""
     state = []
-    for path in (DB, DB + "-wal", os.path.join(_DATA, "creds.json")):
+    for path in (DB, DB + "-wal", os.path.join(_DATA, "creds.json"), PRICE_DB):
         try:
             st = os.stat(path)
             state.append((st.st_mtime_ns, st.st_size))
@@ -1609,6 +1676,12 @@ def summary():
 def _summary():
     if DEMO:
         return demo_summary()
+    # Today's prices, on every return path: what an unpriced DC charge costs (the meaning `tariff`
+    # always had, now from the owner's dated periods before creds.json), and the petrol baseline
+    # savings are set against.
+    book = _book()
+    today = time.strftime("%Y-%m-%d")
+    fuel, fuel_source = book.fuel_rate(today)
     out = {"vehicle": _vehicle(), "online": False, "battery": None, "range_km": None,
            "odometer": None, "volt12": None, "unlocked": None, "speed": None,
            "moving": False, "avg_speed": None, "insights": {}, "health": {}, "drain": None,
@@ -1618,7 +1691,9 @@ def _summary():
            "wltp_kwh_100": WLTP_KWH_100 if WLTP_KNOWN else None,
            "chemistry_known": CHEMISTRY_KNOWN, "powertrain": "bev", "fuel": None,
            "currency": {"symbol": CUR_SYMBOL, "locale": CUR_LOCALE, "code": CUR_CODE},
-           "tyre_unit": TYRE_UNIT, "tariff": TARIFF_IDR, "car_image": _car_image(),
+           "tyre_unit": TYRE_UNIT, "car_image": _car_image(),
+           "tariff": pricing.num(book.charge_rate("dc", today)[0]),
+           "fuel_price": {"per_l": pricing.num(fuel), "kml": book.kml, "source": fuel_source},
            "specs": model_specs(),
            "energy": {"today_kwh": 0.0, "consumption": None, "rating": None,
                       "week_consumption": None},
@@ -1711,7 +1786,7 @@ def _summary():
                        "eff": net_eff(u, r, km, eff), "kwh_hu": round(u, 1), "eff_hu": eff,
                        "regen": round(regen_kw.get(day, 0.0), 1)})
     out["history"] = series
-    res = analyze(data, trips_all, net_day(kwh_day, regen_day))
+    res = analyze(data, trips_all, net_day(kwh_day, regen_day), book)
     out["battery_kwh"] = res["battery_kwh"]
     out["energy"] = res["energy"]
     # prefer the car's own BMS consumption (byte55) over the coarse SoC-derived estimate.
@@ -1751,21 +1826,23 @@ def _summary():
     out["battery_care"] = res.get("battery_care", {})
     out["drain"] = parked_drain(data)                  # SoC lost across offline/parked gaps
     out.update(_volt12_watch(data, now))
-    out["insights"] = insights(out)
+    out["insights"] = insights(out, res["paid"], book)
     lf = out.get("lifetime") or {}                     # saved-vs-petrol over distance actually driven
-    rpkm_l = out["insights"].get("rp_per_km")
     if lf.get("km"):
-        if rpkm_l is not None:
-            lf["saved"] = max(0, round(lf["km"] * (PETROL_RP_L / PETROL_KM_L - rpkm_l)))
-        lf["liters_saved"] = round(lf["km"] / PETROL_KM_L, 1)        # petrol you didn't burn
-        lf["co2_saved"] = round(lf["km"] / PETROL_KM_L * 2.31)       # ~2.31 kg CO2 per litre petrol
+        # The petrol those km would have cost at each day's pump price, less what charging
+        # actually cost. With no charge logged yet there is no spend to set against it, so the
+        # running cost per km stands in for one.
+        spent = (lf["cost"] if out["health"].get("sessions") else
+                 lf["km"] * out["insights"]["rp_per_km"])
+        lf["saved"] = max(0, round(lf["petrol_cost"] - spent))
+        lf["liters_saved"] = round(lf["km"] / book.kml, 1)           # petrol you didn't burn
+        lf["co2_saved"] = round(lf["km"] / book.kml * 2.31)          # ~2.31 kg CO2 per litre petrol
     out["charges"] = {"week": res["charging"]["week"], "month": res["charging"]["month"]}
     return out
 
-def month_history(month):
-    """Per-day km / kWh / charging for one calendar month -- the dashboard's calendar view.
-    month = 'YYYY-MM' (defaults to the current month). Same buckets as summary(): km by trip
-    start, energy from day_energy(), charging from build_sessions()."""
+def _month_bounds(month):
+    """(year, month, first second, first second of the next month) for 'YYYY-MM' -- the current
+    month when it does not parse."""
     try:
         y, m = (int(x) for x in (month or "").split("-")[:2])
         if not (1 <= m <= 12):
@@ -1775,14 +1852,12 @@ def month_history(month):
     t0 = int(time.mktime(time.struct_time((y, m, 1, 0, 0, 0, 0, 0, -1))))
     ny, nm = (y, m + 1) if m < 12 else (y + 1, 1)
     t1 = int(time.mktime(time.struct_time((ny, nm, 1, 0, 0, 0, 0, 0, -1))))
-    ndays = calendar.monthrange(y, m)[1]
-    empty = {"month": f"{y:04d}-{m:02d}", "days": [],
-             "totals": {"km": 0, "kwh": 0.0, "chg_kwh": 0.0, "chg_cost": 0},
-             "resync_km": "skip"}
-    if DEMO:
-        return demo_month(y, m, ndays)
+    return y, m, t0, t1
+
+def _frames(t0, t1):
+    """Every online frame in [t0, t1) as (ts, dt, decoded), oldest first; [] with no database."""
     if not os.path.exists(DB):
-        return empty
+        return []
     conn = db_connect()
     try:
         rows = conn.execute(
@@ -1790,7 +1865,20 @@ def month_history(month):
             (t0, t1)).fetchall()
     finally:
         conn.close()
-    data = [(ts, dt, decode_cached(raw)) for ts, dt, online, raw in rows if online == 1 and raw]
+    return [(ts, dt, decode_cached(raw)) for ts, dt, online, raw in rows if online == 1 and raw]
+
+def month_history(month):
+    """Per-day km / kWh / charging for one calendar month -- the dashboard's calendar view.
+    month = 'YYYY-MM' (defaults to the current month). Same buckets as summary(): km by trip
+    start, energy from day_energy(), charging from build_sessions()."""
+    y, m, t0, t1 = _month_bounds(month)
+    ndays = calendar.monthrange(y, m)[1]
+    empty = {"month": f"{y:04d}-{m:02d}", "days": [],
+             "totals": {"km": 0, "kwh": 0.0, "chg_kwh": 0.0, "chg_cost": 0},
+             "resync_km": "skip"}
+    if DEMO:
+        return demo_month(y, m, ndays)
+    data = _frames(t0, t1)
     if not data:
         return empty
     resync_skip = _resync_skip()
@@ -1808,19 +1896,19 @@ def month_history(month):
         trips_day.setdefault(k, []).append({x: o[x] for x in ("from", "to", "km", "min")})
     fr = [(ts, d2.get("battery"), d2.get("odometer")) for ts, dt2, d2 in data
           if d2.get("battery") is not None and d2.get("odometer") is not None]
-    sess = build_sessions(fr, t1)
+    sess = priced_sessions(data, fr, t1, _book())
     chg = {}                                            # day -> aggregated charging (in + metered cost)
     for s in sess:
         k = time.strftime("%Y-%m-%d", time.localtime(s["start"]))
         d = chg.setdefault(k, {"kwh": 0.0, "cost": 0, "n": 0, "list": []})
-        cost = s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR
         d["kwh"] += s["kwh"]
-        d["cost"] += cost
+        d["cost"] += s["cost"]
         d["n"] += 1
         d["list"].append({"at": time.strftime("%H:%M", time.localtime(s["start"])),
-                          "kwh": round(s["kwh"], 1), "cost": round(cost),
+                          "kwh": round(s["kwh"], 1), "cost": round(s["cost"]),
                           "soc0": s["soc0"], "soc1": s["soc1"],
-                          "min": round(s["dur_h"] * 60), "avg_kw": round(s["avg"], 1)})
+                          "min": round(s["dur_h"] * 60), "avg_kw": round(s["avg"], 1),
+                          **session_price(s)})
     days = []
     for day in range(1, ndays + 1):
         k = f"{y:04d}-{m:02d}-{day:02d}"
@@ -1855,6 +1943,72 @@ def month_history(month):
                        "eff_hu": round(sum(x["kwh_hu"] for x in ok) / ok_km * 100, 1) if ok_km else None,
                        "regen": round(sum(x["regen"] for x in days), 1)},
             "resync_km": "skip" if resync_skip else "count"}
+
+# ---- price book: the charge sessions the owner prices, and what they say each cost ----
+
+def _charge_entry(s):
+    """One priced session as /api/charges lists it."""
+    period = s["period"]
+    return {**session_price(s),
+            "start": time.strftime("%Y-%m-%d %H:%M", time.localtime(s["start"])),
+            "end": time.strftime("%Y-%m-%d %H:%M", time.localtime(s["end"])),
+            "dur_min": round((s["end"] - s["start"]) / 60),
+            "kwh": round(s["kwh"], 1), "kwh_billed": round(s["billed"], 1),
+            "soc0": s["soc0"], "soc1": s["soc1"], "avg_kw": round(s["avg"], 1),
+            "cost": round(s["cost"]),
+            "period": ({x: period[x] for x in ("scope", "start", "label")} if period else None),
+            "override": s["override"]}
+
+def month_charges(month):
+    """Every charge session of one calendar month, priced, and how each was priced -- the list
+    the owner corrects prices from. Drawn from the same frames, the same way, as month_history(),
+    so its sessions and costs are the calendar's. `orphans` are overrides keyed in this month that
+    no session carries any more."""
+    y, m, t0, t1 = _month_bounds(month)
+    book = _book()
+    data = _frames(t0, t1)
+    fr = [(ts, d.get("battery"), d.get("odometer")) for ts, _dt, d in data
+          if d.get("battery") is not None and d.get("odometer") is not None]
+    sess = priced_sessions(data, fr, t1, book)
+    return {"month": f"{y:04d}-{m:02d}", "currency": CUR_CODE,
+            "sessions": [_charge_entry(s) for s in sess],
+            "orphans": [{"id": sid, "start": time.strftime("%Y-%m-%d %H:%M", time.localtime(sid)),
+                         "override": o} for sid, o in book.orphans(sess, t0, t1)],
+            "totals": {"sessions": len(sess), "kwh": round(sum(s["kwh"] for s in sess), 1),
+                       "kwh_billed": round(sum(s["billed"] for s in sess), 1),
+                       "cost": round(sum(s["cost"] for s in sess))}}
+
+def sessions_at(ids):
+    """The charge session each of `ids` falls inside (pricing.window), from the frames two days
+    either side. Raises pricing.UnknownSession for an ID no session covers."""
+    t0, t1 = min(ids) - 2 * 86400, max(ids) + 2 * 86400
+    data = _frames(t0, t1)
+    fr = [(ts, d.get("battery"), d.get("odometer")) for ts, _dt, d in data
+          if d.get("battery") is not None and d.get("odometer") is not None]
+    sess = build_sessions(fr, min(t1, time.time()))
+    found = {}
+    for sid in ids:
+        hit = next((s for s in sess if pricing.window(s)[0] <= sid <= pricing.window(s)[1]), None)
+        if hit is None:
+            raise pricing.UnknownSession("no charge session at %d" % sid)
+        found[hit["start"]] = hit
+    return list(found.values())
+
+def _apply_price(sessions, override):
+    """Pins each of `sessions` to `override`, or clears what they carry when it is None."""
+    if override is None:
+        pricing.delete_overrides(PRICE_DB, [pricing.window(s) for s in sessions])
+    else:
+        pricing.put_overrides(PRICE_DB, [(s["start"], *pricing.window(s)) for s in sessions],
+                              override)
+    return {"ok": True, "sessions": len(sessions)}
+
+def prices_payload():
+    """GET /api/prices: the book as stored, and the creds.json values that price what it does
+    not cover."""
+    return {**pricing.read_book(PRICE_DB), "currency": CUR_CODE,
+            "defaults": {"tariff": TARIFF_IDR, "fuel": pricing.num(PETROL_RP_L),
+                         "fuel_kml": PETROL_KM_L}}
 
 # ---- long-trip planner: geocode (Nominatim) + route (OSRM) + SPKLU (Overpass/OSM), all keyless ----
 _UA_TRIP = "carlinko-trip/1.0 (personal EV dashboard)"
@@ -2184,6 +2338,7 @@ def trip_plan(frm, to, soc, cons, reserve=10.0, target=80.0, derate=1.0, a=None,
     if not b: return {"error": f"can't find '{to}'"}
     dist, dur, geom = _osrm(a, b)
     cons = cons or WLTP_KWH_100
+    dc_price = _book().charge_rate("dc", time.strftime("%Y-%m-%d"))[0]   # route stops are DC
     rpp = CAP_KWH / cons / max(0.5, derate)             # km gained per 1% SoC (derated for conditions)
     full_range = 100 * rpp
     buffer = reserve                                    # min SoC to arrive at any stop / finish with (safety margin)
@@ -2239,7 +2394,7 @@ def trip_plan(frm, to, soc, cons, reserve=10.0, target=80.0, derate=1.0, a=None,
                       "station_lat": round(slat, 5) if slat is not None else None,
                       "station_lon": round(slon, 5) if slon is not None else None,
                       "charge_from": arrive_at, "charge_to": ch_to,
-                      "kwh": round(bill, 1), "cost": round(bill * TARIFF_IDR),
+                      "kwh": round(bill, 1), "cost": round(bill * dc_price),
                       "kw": skw or None, "conns": sconns, "avail": savail, "avail_updated": supd,
                       "min": max(5, round(into / eff_kw * 60))})
         cur = ch_to; pos = new_pos
@@ -2360,6 +2515,18 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_exception("GET /api/service-centres failed", e)
                 self._send(502, b'{"error":"service centre search unavailable"}', "application/json")
+            return
+        if path in ("/api/prices", "/api/charges"):    # the price book, and the sessions it prices
+            if DEMO:
+                self._send(404, b'{"error":"not available in demo"}', "application/json"); return
+            try:
+                q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+                result = (prices_payload() if path == "/api/prices" else
+                          month_charges((q.get("month") or [""])[0]))
+                self._send(200, json.dumps(result).encode(), "application/json")
+            except Exception as e:
+                _log_exception("GET %s failed" % path, e)
+                self._send(500, b'{"error":"price book unavailable"}', "application/json")
             return
         if path == "/api/maintenance/records":         # the whole log: preferences + every record
             try:
@@ -2538,6 +2705,8 @@ class H(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/maintenance/"):
             self._maintenance_write(path); return
+        if path == "/api/prices" or path.startswith("/api/charges/"):
+            self._price_write(path); return
         prefix = "/api/push/installations/"
         if not path.startswith(prefix) or "/" in path[len(prefix):]:
             self._send(404, b'{"error":"not found"}', "application/json"); return
@@ -2567,6 +2736,8 @@ class H(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/maintenance/"):
             self._maintenance_write(path); return
+        if path.startswith("/api/charges/"):
+            self._price_write(path); return
         prefix = "/api/push/installations/"
         if not path.startswith(prefix) or "/" in path[len(prefix):]:
             self._send(404, b'{"error":"not found"}', "application/json"); return
@@ -2629,10 +2800,71 @@ class H(BaseHTTPRequestHandler):
             return
         self._send(200, json.dumps(result).encode(), "application/json")
 
+    def _price_write(self, path):
+        """Writes to the price book: the dated periods (PUT /api/prices), one session's price
+        (PUT/DELETE /api/charges/{id}/price) and many sessions' at once (POST
+        /api/charges/prices). Every body is validated whole, and every session it names found,
+        before anything is stored."""
+        if not self._authed():
+            self._send(401, b'{"error":"auth"}', "application/json"); return
+        if DEMO:
+            self._send(404, b'{"error":"not available in demo"}', "application/json"); return
+        charge = "/api/charges/"
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if self.command == "PUT" and path == "/api/prices":
+                if not 0 < n <= pricing.BOOK_MAX:
+                    raise ValueError("invalid body size")
+                pricing.put_book(PRICE_DB, pricing.validate_book(json.loads(self.rfile.read(n))))
+                result = prices_payload()
+            elif self.command == "POST" and path == "/api/charges/prices":
+                if not 0 < n <= pricing.BOOK_MAX:
+                    raise ValueError("invalid body size")
+                body = json.loads(self.rfile.read(n))
+                if not isinstance(body, dict) or set(body) - {"ids", "price", "clear"}:
+                    raise ValueError("body must be {ids, price} or {ids, clear: true}")
+                ids = body.get("ids")
+                if not isinstance(ids, list) or not 0 < len(ids) <= pricing.BULK_MAX:
+                    raise ValueError("ids must list 1 to %d sessions" % pricing.BULK_MAX)
+                ids = [pricing.valid_session_id(sid) for sid in ids]
+                override = None if body.get("clear") is True else pricing.validate_override(body.get("price"))
+                result = _apply_price(sessions_at(ids), override)
+            elif (path.startswith(charge) and path.endswith("/price")
+                  and self.command in ("PUT", "DELETE")):
+                sid = pricing.valid_session_id(path[len(charge):-len("/price")])
+                if self.command == "DELETE":
+                    try:
+                        hit = sessions_at([sid])
+                    except pricing.UnknownSession:      # an orphan, cleared by its own key
+                        if not pricing.delete_overrides(PRICE_DB, [(sid, sid)]):
+                            raise
+                        hit = []
+                    result = _apply_price(hit, None) if hit else {"ok": True, "sessions": 0}
+                else:
+                    if not 0 < n <= pricing.OVERRIDE_MAX:
+                        raise ValueError("invalid body size")
+                    override = pricing.validate_override(json.loads(self.rfile.read(n)))
+                    result = _apply_price(sessions_at([sid]), override)
+            else:
+                self._send(404, b'{"error":"not found"}', "application/json"); return
+        except pricing.UnknownSession as e:
+            self._send(404, json.dumps({"error": str(e)}).encode(), "application/json")
+            return
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            self._send(400, json.dumps({"error": str(e)[:120]}).encode(), "application/json")
+            return
+        except Exception as e:
+            _log_exception("%s %s failed" % (self.command, path), e)
+            self._send(500, b'{"error":"price book unavailable"}', "application/json")
+            return
+        self._send(200, json.dumps(result).encode(), "application/json")
+
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/api/maintenance/receipts":
             self._maintenance_write(path); return
+        if path == "/api/charges/prices":
+            self._price_write(path); return
         if path == "/api/login":
             try:
                 n = int(self.headers.get("Content-Length") or 0)

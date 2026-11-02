@@ -81,21 +81,26 @@ class SummaryCacheTest(unittest.TestCase):
 
 
 class SummaryInputsTest(unittest.TestCase):
-    def test_inputs_follow_the_database_its_log_and_the_credentials(self):
+    def test_inputs_follow_the_database_its_log_the_credentials_and_the_prices(self):
         with tempfile.TemporaryDirectory() as data, \
                 patch.object(server, "_DATA", data), \
-                patch.object(server, "DB", os.path.join(data, "carlinko.db")):
-            self.assertEqual(server._summary_inputs(), (None, None, None))
+                patch.object(server, "DB", os.path.join(data, "carlinko.db")), \
+                patch.object(server, "PRICE_DB", os.path.join(data, "prices.db")):
+            self.assertEqual(server._summary_inputs(), (None, None, None, None))
             with open(os.path.join(data, "carlinko.db"), "w") as f:
                 f.write("frames")
-            database, wal, creds = server._summary_inputs()
+            database, wal, creds, prices = server._summary_inputs()
             self.assertIsNotNone(database)
             self.assertIsNone(wal)
             self.assertIsNone(creds)
+            self.assertIsNone(prices)
             # A web login or first-run setup writes creds.json after the server started.
             with open(os.path.join(data, "creds.json"), "w") as f:
                 f.write("{}")
             self.assertIsNotNone(server._summary_inputs()[2])
+            # A price edit reprices every session, so it must not wait out the cache.
+            server.pricing.put_book(server.PRICE_DB, {"fuel_kml": 14.0})
+            self.assertIsNotNone(server._summary_inputs()[3])
 
 
 if __name__ == "__main__":
