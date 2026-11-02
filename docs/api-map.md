@@ -226,6 +226,9 @@ does. A release must record any new IDs in this table.
 
 ### Voltmoss push binding (optional)
 
+The relay itself lives in [`push_relay/`](../push_relay/README.md), with its
+setup, deployment and HTTP contract.
+
 Set `VOLTMOSS_PUSH_RELAY_URL` to the operator's HTTPS relay URL and
 `VOLTMOSS_PUSH_HTTPS=1` only when the dashboard's public address is HTTPS.
 Set `VOLTMOSS_PUSH_DISPATCHER=1` only after the dispatcher is deployed and
