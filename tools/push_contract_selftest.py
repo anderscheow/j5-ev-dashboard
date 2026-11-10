@@ -93,8 +93,7 @@ class PushContractTest(unittest.TestCase):
 
     def enable(self):
         server.set_dashboard_password("password")
-        env = patch.dict(os.environ, {"VOLTMOSS_PUSH_RELAY_URL": "https://relay.example.test",
-                                   "VOLTMOSS_PUSH_HTTPS": "1",
+        env = patch.dict(os.environ, {"VOLTMOSS_PUSH_HTTPS": "1",
                                    "VOLTMOSS_PUSH_DISPATCHER": "1"})
         env.start()
         self.addCleanup(env.stop)
@@ -112,12 +111,12 @@ class PushContractTest(unittest.TestCase):
             self.assertNotIn("push_alerts", self.request("GET", "/api/status")[1]["capabilities"])
 
     def test_requires_gated_https_and_session(self):
-        with patch.dict(os.environ, {"VOLTMOSS_PUSH_RELAY_URL": "https://relay.example.test",
-                                     "VOLTMOSS_PUSH_HTTPS": "1",
+        self.assertEqual(server.PUSH_RELAY_URL,
+                         "https://push-relay-production-149c.up.railway.app")
+        with patch.dict(os.environ, {"VOLTMOSS_PUSH_HTTPS": "1",
                                      "VOLTMOSS_PUSH_DISPATCHER": "1"}):
             self.assertNotIn("push_alerts", self.request("GET", "/api/status")[1]["capabilities"])
-        with patch.dict(os.environ, {"VOLTMOSS_PUSH_RELAY_URL": "http://relay.example.test",
-                                     "VOLTMOSS_PUSH_HTTPS": "1",
+        with patch.dict(os.environ, {"VOLTMOSS_PUSH_HTTPS": "0",
                                      "VOLTMOSS_PUSH_DISPATCHER": "1"}):
             server.set_dashboard_password("password")
             self.assertNotIn("push_alerts", self.request("GET", "/api/status")[1]["capabilities"])

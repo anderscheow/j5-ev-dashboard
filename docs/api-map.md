@@ -282,11 +282,12 @@ and meaning, and a dashboard with no price book reports the same costs as before
 
 ### Voltmoss push binding (optional)
 
-The relay itself lives in [`push_relay/`](../push_relay/README.md), with its
-setup, deployment and HTTP contract.
+The relay itself lives in the [Voltmoss app repository](https://github.com/anderscheow/j5_ev_app/tree/main/push_relay), with its setup, deployment and HTTP contract. The app sends its FCM installation ID and selected dashboard HTTPS URL to that relay during registration. The relay stores the URL as registration metadata and never fetches it.
 
-Set `VOLTMOSS_PUSH_RELAY_URL` to the operator's HTTPS relay URL and
-`VOLTMOSS_PUSH_HTTPS=1` only when the dashboard's public address is HTTPS.
+The app and dispatcher use the fixed publisher relay
+`https://push-relay-production-149c.up.railway.app`. No relay URL variable is
+needed on a dashboard. Set `VOLTMOSS_PUSH_HTTPS=1` only when the dashboard's
+public address is HTTPS.
 Set `VOLTMOSS_PUSH_DISPATCHER=1` only after the dispatcher is deployed and
 running; the status capability checks the dispatcher's live lease and is absent
 when the worker is stopped. The dispatcher watches committed telemetry rows,
@@ -301,12 +302,13 @@ the phone's clock (the binding's `time_zone`), which the relay prints as
 
 On Railway, `tools/railway_start.sh` starts one dispatcher beside the logger
 and web server when the flag is `1`; keep a persistent `/data` volume for
-`push_alerts.db`. With Docker Compose, set the three variables on the web and
+`push_alerts.db`. With Docker Compose, set the two flags on the web and
 dispatcher services, then start `docker compose --profile push up -d` so the
 single `push-dispatcher` service runs. A plain `tools/run.py` launch also starts
 it when enabled. Do not start two dispatchers against the same data volume;
 the SQLite lease is a recovery guard, not an instruction to scale it out.
-Configure a dashboard password. Without all three, `/api/status` omits
+Configure a dashboard password. Without the HTTPS and dispatcher flags,
+the running worker, and the password gate, `/api/status` omits
 `push_alerts`, `GET /api/push/status` answers `enabled:false`, and writes are
 unavailable. The client must also refuse a non-HTTPS dashboard URL. The relay
 and dispatcher are separate components; enabling the capability requires both

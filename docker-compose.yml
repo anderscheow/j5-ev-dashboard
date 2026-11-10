@@ -15,7 +15,6 @@ services:
     volumes:
       - ./data:/data
     environment:
-      VOLTMOSS_PUSH_RELAY_URL: ${VOLTMOSS_PUSH_RELAY_URL:-}
       VOLTMOSS_PUSH_HTTPS: ${VOLTMOSS_PUSH_HTTPS:-0}
       VOLTMOSS_PUSH_DISPATCHER: ${VOLTMOSS_PUSH_DISPATCHER:-0}
     restart: unless-stopped
@@ -36,7 +35,6 @@ services:
     volumes:
       - ./data:/data
     environment:
-      VOLTMOSS_PUSH_RELAY_URL: ${VOLTMOSS_PUSH_RELAY_URL:-}
       VOLTMOSS_PUSH_HTTPS: ${VOLTMOSS_PUSH_HTTPS:-0}
       VOLTMOSS_PUSH_DISPATCHER: ${VOLTMOSS_PUSH_DISPATCHER:-0}
     restart: unless-stopped

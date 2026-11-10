@@ -51,15 +51,15 @@ CAPABILITIES = (
     "price_book",
 )
 
-# The operator explicitly enables the relay and asserts this dashboard is
-# reached through HTTPS. The app also checks its configured base URL. A public
-# ungated dashboard cannot enroll a device in a centrally operated service.
+# All Voltmoss installations send to the same publisher-operated relay. The
+# operator still explicitly enables dispatch and asserts that this dashboard
+# is reached through HTTPS. A public ungated dashboard cannot enroll a phone.
+PUSH_RELAY_URL = "https://push-relay-production-149c.up.railway.app"
+
 def push_configured():
-    relay = os.environ.get("VOLTMOSS_PUSH_RELAY_URL", "").rstrip("/")
     return (not DEMO and is_configured() and _gated() and
             os.environ.get("VOLTMOSS_PUSH_HTTPS") == "1" and
-            os.environ.get("VOLTMOSS_PUSH_DISPATCHER") == "1" and
-            relay.startswith("https://") and not relay.startswith("https://localhost"))
+            os.environ.get("VOLTMOSS_PUSH_DISPATCHER") == "1")
 
 def push_enabled():
     if not push_configured():

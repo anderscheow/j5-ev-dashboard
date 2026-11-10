@@ -454,10 +454,7 @@ class Dispatcher:
 
 def main():
     import server
-    relay_url = os.environ.get("VOLTMOSS_PUSH_RELAY_URL", "")
-    if not relay_url:
-        raise SystemExit("push dispatcher requires HTTPS relay configuration")
-    dispatcher = Dispatcher(server.DB, server.PUSH_DB, RelayClient(relay_url))
+    dispatcher = Dispatcher(server.DB, server.PUSH_DB, RelayClient(server.PUSH_RELAY_URL))
     while True:
         if not server.push_configured():
             time.sleep(5)  # first-run setup may create creds.json later

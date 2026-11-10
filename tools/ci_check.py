@@ -36,7 +36,7 @@ def bad(path, msg):
 
 
 def check_python():
-    files = tracked("tools/*.py") + tracked("push_relay/*.py")
+    files = tracked("tools/*.py")
     for f in files:
         try:
             with open(f, encoding="utf-8") as fh:
