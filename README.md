@@ -1,460 +1,122 @@
-# J5 EV Dashboard — a self-hosted telematics dashboard for the Jaecoo J5 EV
+# J5 EV Dashboard
 
-**English** · [Bahasa Indonesia](README.id.md)
+**English** · [Bahasa Indonesia](README.id.md) · [简体中文](README.zh-CN.md) · [Bahasa Melayu](README.ms.md)
 
-A clean, mobile-first PWA that shows the **real** numbers your car already reports —
-battery, range, odometer, charging sessions, efficiency, tyre status, 12 V health, trip
-log, lifetime cost, a long-trip charge planner, and an interactive SPKLU (EV charger) map.
+A self-hosted dashboard for CarLinko cars. It records the telemetry your car already sends and shows battery, charging, trips, tyres, costs and vehicle status in a browser. The [Voltmoss app](https://github.com/anderscheow/j5_ev_app) connects to each owner's dashboard; each owner runs a separate instance.
 
-It exists because the stock CarLinko app hides most of this (tyres only show
-"normal/abnormal", there are no trip totals, no charge-cost history, no road-trip planner).
-Everything here is derived from data the car **already** sends to its own cloud — this
-project just reads your own account and presents it properly.
+![Push architecture: app, owner dashboard and Voltmoss relay](docs/media/push-architecture.svg)
 
-> Built against real cars, not a spec sheet. Charge-cost output matches the owner's PLN Mobile
-> receipts to **99.6–99.9 %** (see [Accuracy](#accuracy)) — that figure is from one car, since it
-> needs real receipts to check against. The telemetry decode itself is confirmed on two.
+The dashboard stores your CarLinko credentials and telemetry on your own host. If you enable Voltmoss push alerts, your dashboard detects alert conditions and sends small events to the centrally operated relay. The relay delivers notifications through Firebase; it never polls your dashboard. See [the API and push contract](docs/api-map.md).
 
-> **Other CarLinko cars?** Confirmed on **four cars, three brands, two powertrains, four countries** —
-> a Jaecoo J5 EV (BEV, Indonesia), a Chery Tiggo 8 PHEV (South Africa), a Chery Tiggo 7 PHEV
-> (Malaysia) and an Omoda E5 (BEV, Uruguay). Every telemetry byte
-> offset held identical across all of them, which suggests the blob layout comes from the CarLinko
-> platform itself rather than the model. The per-model constants that *do* differ (tyre scale,
-> powertrain, the car's own photo) are read from the API at setup, so a new car largely configures
-> itself.
->
-> Caveat worth stating plainly: Jaecoo, Omoda, Exeed and Chery are all **Chery Group** brands, and
-> CarLinko is Chery Group's app — so "works on CarLinko" realistically means "works across Chery
-> Group", not literally any car. Four cars is a strong signal, not proof: bytes we haven't mapped
-> may well differ, and no pure-ICE car has been tried. If you have a different car, please try it
-> and file a [compatibility report](https://github.com/GodrezJr2/j5-ev-dashboard/issues/new?template=compatibility.md) — a second car
-> was worth more to this project than any amount of staring at the first. 🙏
+## What it does
 
-## Demo
+- Live battery, range, charging, tyre and 12 V status.
+- Charge sessions, efficiency, trips, history and owner-set prices.
+- Charge planning, a charger map and Home Assistant access.
+- Vehicle controls where supported. These are real car commands; [read the control notes](docs/control-opcodes.md) before using them.
 
-<p align="center"><img src="docs/media/walkthrough.gif" width="800" alt="Walkthrough of the v2 interface: home, energy, distance calendar, 3D doors view, charging and the charge calculator"></p>
+Try it without an account: `docker compose run --rm -p 8088:8088 web python server.py --demo 8088`, then open <http://localhost:8088>. The sample data never contacts a car.
 
-*One continuous take of the v2 interface on a phone-sized screen, running the built-in demo mode
-(`python server.py --demo`, sample data, no account needed). Cut in [Motion Studio](https://github.com/GodrezJr2/motion-studio).*
+## Set up your own dashboard with Docker
 
-Recorded on a real car instead: [1½ minutes on a phone against a real Jaecoo J5 EV](https://github.com/user-attachments/assets/f17d167d-cbf9-4eb0-92b4-44361f6da6a5)
-(Classic interface, plate and VIN masked, also [downloadable](https://github.com/GodrezJr2/j5-ev-dashboard/releases/download/assets/j5-dashboard-demo.mp4)).
+You need Docker Compose, a CarLinko account with access to your car, and a host that stays on to collect history. The logger uses a live CarLinko session. To avoid signing the official app out, create a second CarLinko account and authorise it for your car from **Me → Authorisation → +** in the primary account.
 
-## Screenshots
+1. Clone this fork and start the web server and logger:
 
-The **v2 interface** (`/v2.html`, or pick it as the default under Settings). The pictures follow your GitHub theme;
-both a light and a dark theme are built in.
+   ```bash
+   git clone https://github.com/anderscheow/j5-ev-dashboard.git
+   cd j5-ev-dashboard
+   docker compose up -d --build
+   ```
 
-<table>
-<tr><th>Home</th><th>Energy</th><th>Distance</th></tr>
-<tr><td align="center" width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/v2-home-dark.jpg"><img src="docs/screenshots/v2-home-light.jpg" width="260" alt="Home: range, battery, climate, doors and tyres"></picture></td><td align="center" width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/v2-energy-dark.jpg"><img src="docs/screenshots/v2-energy-light.jpg" width="260" alt="Energy: kWh/100 km per day, net of regen, beside the head-unit figure"></picture></td><td align="center" width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/v2-dist-dark.jpg"><img src="docs/screenshots/v2-dist-light.jpg" width="260" alt="Distance: a calendar of km, energy and charging cost per day"></picture></td></tr>
-<tr><th>Doors &amp; windows</th><th>Charging</th><th>Charge calculator</th></tr>
-<tr><td align="center" width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/v2-doors-dark.jpg"><img src="docs/screenshots/v2-doors-light.jpg" width="260" alt="Doors and windows on a 3D car you can turn, with remote controls"></picture></td><td align="center" width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/v2-chg-dark.jpg"><img src="docs/screenshots/v2-chg-light.jpg" width="260" alt="Charging: last session curve, kWh in and cost"></picture></td><td align="center" width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/v2-plan-dark.jpg"><img src="docs/screenshots/v2-plan-light.jpg" width="260" alt="Charge calculator: time, kWh and cost to a target %"></picture></td></tr>
-</table>
+2. Open <http://localhost:8088>. On the first visit, enter your CarLinko credentials in the dashboard login page. It detects your car and saves credentials, tokens and telemetry in `./data`. Keep that directory persistent and private.
+3. Check the services and logs:
 
-*Shown with demo data. Plate and VIN are masked by default (privacy eye-toggle).*
+   ```bash
+   docker compose ps
+   docker compose logs --tail=80 web logger
+   curl http://localhost:8088/api/status
+   ```
 
-The **Classic interface** (the default at `/`) adds the long-trip planner and the SPKLU map:
+For access away from home, use a private network such as Tailscale. If the dashboard will have a public URL, put it behind HTTPS and set a **dashboard password** from the login page's Advanced section before exposing it. The app connects using that HTTPS URL and unlocks with the dashboard password.
 
-<table>
-<tr><th>Trip planner</th><th>SPKLU map</th></tr>
-<tr><td align="center" valign="top"><img src="docs/screenshots/trip-planner.png" width="300" alt="Long-trip planner — route, on-route charge stops with connectors and arrival %"></td><td align="center" valign="top"><img src="docs/screenshots/spklu-map.png" width="300" alt="Interactive SPKLU map — pins, live availability, directions"></td></tr>
-</table>
+### Optional: push alerts in Voltmoss
 
----
+Push requires a public HTTPS dashboard URL and a dashboard password. The app and dashboard both use the fixed Voltmoss relay at `https://push-relay-production-149c.up.railway.app`; dashboard owners do not configure its URL or need Firebase credentials. Put these flags in a `.env` file beside `docker-compose.yml`:
 
-## ⚠️ Legal & ethics — read this first
-
-This is a **personal interoperability / reverse-engineering** project for accessing **your
-own vehicle and your own account**. It is provided for educational and personal use.
-
-- **Use it only with an account and a car you own.** Do not access anyone else's data.
-- This talks to a **private, undocumented vendor API**. There is **no warranty** and it can
-  break at any time if the vendor changes their backend. It is **not affiliated with,
-  endorsed by, or supported by** Jaecoo, Chery, or CarLinko.
-- **No personal data is shipped.** Your account, token, VIN, plate, vehicle id and device
-  serial live only in a gitignored `creds.json` (see [Setup](#setup)). The request-signing key
-  is an **app-global constant** (the same string baked into every CarLinko install, trivially
-  readable from the APK) — it's bundled so setup is just email + password; it is not a secret
-  tied to you.
-- **Do not run this as a public/hosted multi-user service.** Doing so means storing other
-  people's credentials (which can unlock/control their car) and almost certainly violates the
-  vendor's terms. The intended deployment is **one instance per owner**, self-hosted, private
-  (e.g. behind Tailscale). See [Going multi-user](#going-multi-user).
-- Mostly read-only. There **is** a Control tab (lock, A/C, windows, sunroof, tailgate, find-car,
-  stop-charge), but it is **beta**: only *Stop charging* is a confirmed opcode, the rest are
-  best-effort decodes from the APK, and every tap is a **real actuation on a real car** — watch
-  the car when you use it. It is also **cloud-only: no Bluetooth.** The CarLinko app's
-  Bluetooth-proximity control is **not** implemented, so the car must be awake and have cellular
-  signal or the command just fails (`50043`).
-
-If you don't accept the above, don't use this.
-
----
-
-## Features
-
-- **Live status** — battery %, range, odometer, 12 V, online/parked/charging/driving state,
-  pulled from the realtime WebSocket and cached in SQLite.
-- **Charging** — auto-detected charge sessions (kWh into pack, kWh billed at the meter, cost),
-  a charge-curve chart, weekly/monthly counts, and a "charge to X %" planner with real SPKLU
-  tariffs. Regen blips are filtered out so they don't pollute charge history.
-- **Efficiency & trips** — per-trip and rolling kWh/100 km with honest guards, lifetime kWh /
-  cost / km, and savings vs petrol at real Indonesian fuel prices.
-- **Long-trip planner** — set start/finish, get on-route charge stops sized to arrive with a
-  safety margin (ABRP-style), with real connector type / kW / live availability from Google.
-- **SPKLU map** — pan an interactive map, tap a charger for connectors, live availability and
-  directions (PLN-Mobile-style), data from Google Places.
-- **Remote control (beta)** — a Control tab that fires the real `74<cmd><state>` opcodes at the
-  car: lock/unlock, A/C on/off + target temp, windows, sunroof, tailgate, find-car, stop charging.
-  Only *stop charging* is confirmed; the rest are best-effort labels you can re-map by long-pressing
-  a button. **Cloud only — no Bluetooth.** See [docs/control-opcodes.md](docs/control-opcodes.md).
-- **Battery care, service countdown, tyre view, privacy toggles, dark mode, EN/ID i18n.**
-- **Home Assistant** — read it all over a REST sensor and get battery-low / charge-done notifications. See [docs/HOMEASSISTANT.md](docs/HOMEASSISTANT.md). Prefer a native integration? [ha-carlinko](https://github.com/jebentancour/ha-carlinko) by [@jebentancour](https://github.com/jebentancour) (read-only, built on the same telemetry).
-
-See [PRODUCT.md](PRODUCT.md) for the product rationale and [DESIGN.md](DESIGN.md) for the
-visual system.
-
-## Architecture
-
-```
-  Car TCU ──(cellular)──> CarLinko cloud  ──┐
-                                            │  WebSocket (token auth, no signing) — telemetry blob
-   tools/logger.py  ◀───────────────────────┘  decodes + stores every frame to carlinko.db
-        │                                       (auth.py auto-refreshes the token on expiry)
-        ▼
-   carlinko.db (SQLite)
-        │
-        ▼
-   tools/server.py  ── /api/summary, /api/trip, /api/spklu ──▶  web/ PWA (vanilla JS, Leaflet)
-   (stdlib http.server)        + Google Places (optional)        served over Tailscale
+```env
+VOLTMOSS_PUSH_HTTPS=1
+VOLTMOSS_PUSH_DISPATCHER=1
 ```
 
-- **No framework, no build step.** Backend is Python standard library; frontend is hand-written
-  HTML/CSS/JS with two vendored libs (Leaflet, slot-text). Self-hosted and offline-friendly.
-- **The telemetry is a 73-byte blob.** Field offsets were recovered by driving the car and
-  watching which bytes moved (battery = byte 28, range = 29–30 BE, odometer = 18–20 BE, …).
-  See [docs/api-map.md](docs/api-map.md).
-
-## Accuracy
-
-The charge analytics are calibrated against the owner's real PLN Mobile receipts:
-
-| Session            | Dashboard            | Receipt              | Match   |
-| ------------------ | -------------------- | -------------------- | ------- |
-| 58 → 100 %         | 28.9 kWh / Rp 73,491 | 28.94 kWh / Rp 73,521 | 99.9 % |
-| 35 → 80 %          | 29.1 kWh / Rp 73,981 | 29.23 kWh / Rp 74,273 | 99.6 % |
-
-DC charge efficiency is modelled as SoC-dependent (charging to 100 % loses more than to 80 %),
-calibrated to two receipts. Usable pack ≈ 58.9 kWh.
-
-The charge planner predicts what you'll actually pay at the meter, checked against a real
-PLN Mobile SPKLU receipt:
-
-| The app's charge planner | The real PLN Mobile receipt |
-| :---: | :---: |
-| ![Charge planner estimate](docs/screenshots/accuracy-app.png) | ![PLN Mobile SPKLU receipt](docs/screenshots/accuracy-receipt.png) |
-
-The app estimates **58.2 kWh** to buy at the meter at **Rp 2,540/kWh**; the receipt shows
-**57.34 kWh** actually delivered at the same **Rp 2,540/kWh** all-in tariff — the per-kWh
-price is exact and the volume lands within ~1.5 % (the receipt session stopped a little short
-of a full charge). The refund maths line up too: bought Rp 152,448, used Rp 145,694.
-
-## Try it first (demo, no account)
-Want to see the UI before setting anything up? Run it in **demo mode** — fake but realistic data,
-no CarLinko account, no car, no database:
-```bash
-cd tools && python server.py --demo      # then open http://localhost:8088
-# or with Docker:  docker compose run --rm -p 8088:8088 web python server.py --demo 8088
-```
-A 🧪 *Demo mode* banner makes clear nothing is real. Nice for a quick look or a screenshot.
-
-## Privacy & security
-This runs **entirely on your machine** — there is no backend operated by me, and your data is
-never sent to any server I control. See **[SECURITY.md](SECURITY.md)** for the full picture; in short:
-- Your CarLinko **email/password** are stored locally in `tools/creds.json` (gitignored) and used
-  only to log in to **CarLinko's own** cloud (`*.hzhjcl.com`) over TLS — same place the app talks to.
-- The only other outbound calls are to **Google Maps** (if you add a key) and free map/route
-  services (OpenStreetMap / OSRM) for the trip planner. Nothing else leaves your device.
-- Keep the dashboard private (LAN / Tailscale). If it must face the internet, set a
-  `dashboard_password` so `/api/summary` isn't open to the world.
-- Found a security issue? See [SECURITY.md](SECURITY.md) — please report privately, don't open a public issue.
-
-## Setup
-
-### Prerequisites
-- Python 3.10+, `pip install requests websocket-client`
-- A CarLinko account with your car on it
-- (optional) a Google Maps API key for the trip planner / SPKLU map
-
-No app capture, no MITM, no decompiling needed — you just log in with your account. (The
-signing key is bundled, and the `v-data` blob the app sends turned out to be ignored by the
-server, so it's dropped entirely.)
-
-### Use a second account (recommended)
-CarLinko keeps **one active session per account**, so logging the dashboard in can sign you out
-of the official app. Avoid the clash by giving the dashboard its **own** CarLinko account:
-
-1. Make a second CarLinko account (different email).
-2. From your main account, **Me → Authorisation → +** and authorise the second account's email
-   to your car.
-3. Log the dashboard into the second account; keep the app on your main account.
-
-> Heads-up: the in-app *Authorisation* screen describes Bluetooth control sharing — confirm the
-> authorised account can also pull the car over the **cloud** (run `python setup.py` on it; if
-> auto-detect finds the vehicle, you're good). If it can't, the alternative is to just use one
-> account and accept the occasional re-login.
-
-### Quick start — Windows, no Docker (easiest)
-1. On this page click **Code → Download ZIP**, then extract it.
-2. Double-click **`start.bat`**. First run installs Python if you lack it (then double-click again)
-   and two small libraries.
-3. Your browser opens the login page. Enter your CarLinko email + password; it finds your car.
-
-Leave the window open — it runs the dashboard *and* the logger. Same limits as everywhere:
-the PC has to stay on to build history. Not on Windows? `python tools/run.py` does the same.
-
-### Quick start — Docker
-```bash
-docker compose up -d        # then open http://localhost:8088
-```
-On first open the dashboard shows a **login page** — enter your CarLinko **email + password** and
-it logs in and **auto-detects your car** (vehicle id, device SN, VIN, plate, model). That's it.
-Prefer the terminal? `docker compose run --rm web python setup.py` does the same interactively.
-Everything that persists (creds, token, database) lives in `./data`.
-
-### Quick start — one command (Linux, always-on)
-
-If you have a machine that stays on — a home server, a mini PC, a Raspberry Pi — this does the
-whole thing: virtualenv, dependencies, login, and both systemd services so it survives reboots.
+Start one dispatcher alongside the web server and logger:
 
 ```bash
-git clone https://github.com/GodrezJr2/j5-ev-dashboard.git
-cd j5-ev-dashboard
-./tools/install.sh                 # add --tailscale to reach it from your phone anywhere
+docker compose --profile push up -d --build
+docker compose ps
 ```
 
-It only asks what it can't work out: your CarLinko login, and your country/currency. Everything
-scoped to the current user and this folder — no paths assumed, nothing installed globally except
-Tailscale if you ask for it.
+Connect the app to your dashboard's HTTPS URL, unlock it, enable at least one eligible Plus alert, and allow notifications. The app registers its FCM installation ID and dashboard URL with the relay, then registers the relay-issued installation ID and scoped secret with your dashboard. The dispatcher evaluates **committed telemetry** and sends matching events to the relay. Check the public `/api/status` response for `push_alerts`; after unlocking, `/api/push/status` should report `enabled: true`. If either check fails, inspect `docker compose logs --tail=100 web push-dispatcher`.
 
-```
-./tools/install.sh --tailscale     # + private access from anywhere, nothing exposed publicly
-./tools/install.sh --port 9000     # different port
-./tools/install.sh --no-service    # just set it up; don't install systemd units
-```
+## Update when a dashboard release is published
 
-**Why `--tailscale`?** The logger needs to run 24/7 to build trends, charge history and cost. You'll
-want the dashboard on your phone — but this reads your car's data, so you should *not* port-forward
-it to the open internet. Tailscale puts the machine and your phone on a private network, so the
-dashboard is reachable from anywhere while staying invisible to everyone else. It's free for
-personal use.
-
-### Quick start — Python (manual)
-```bash
-pip install requests websocket-client
-cd tools
-python setup.py                # interactive config + login + auto-detect car
-python logger.py --adaptive    # record telemetry (fast when awake, slow when parked)
-python server.py 8088          # dashboard at http://<host>:8088
-```
-Prefer not to use the helper? `cp creds.example.json tools/creds.json && chmod 600 tools/creds.json`
-and fill it in by hand. `creds.json` and `token.txt` are gitignored — never commit them.
-
-Reference systemd units are in [`tools/`](tools/) if you'd rather write them yourself
-([logger](tools/carlinko-logger.service), [web](tools/carlinko-web.service)) — but `install.sh`
-generates correct ones for your user and paths, so you shouldn't need to.
-
-### View backend logs
-
-The dashboard writes timestamped `INFO`, `WARNING`, and `ERROR` lines to stderr. Every HTTP
-response records its method, path and outcome; application failures returned with HTTP 200 are
-also marked as warnings. Caught errors record their exception type and source location. Query
-strings, cookies, request bodies, passwords and tokens are omitted. Set `CARLINKO_LOG_LEVEL=WARNING`
-to show only warnings and errors (the default is `INFO`). The telemetry logger runs separately
-and writes its poll output to its own service log.
-
-On Railway the same lines are written to stdout as one JSON object each (`level`, `message`,
-`logger`), because Railway marks every stderr line as an error regardless of what it says. This
-switches on by itself when `RAILWAY_ENVIRONMENT_NAME` is set; `CARLINKO_LOG_FORMAT=json` or
-`=text` forces either format anywhere.
-
-| Deployment | View live logs |
-| --- | --- |
-| Docker Compose | `docker compose logs -f web logger` |
-| systemd | `journalctl -fu carlinko-web -u carlinko-logger` |
-| Railway | Open the service's **Logs** tab |
-| `start.sh` or `tools/run.py` | Read the terminal where it is running |
-
-### `creds.json` reference
-| key | required | what |
-| --- | --- | --- |
-| `email`, `password` | ✅ | your CarLinko login (plaintext over TLS; stored locally only) |
-| `region` | | API region, default `sea` (Southeast Asia). **Login fails with the wrong one** — an account made in Europe/Middle East/Africa needs `emea` (reported on a J5 Noble in Israel, [#6](https://github.com/GodrezJr2/j5-ev-dashboard/issues/6)). If a correct password is refused, try another region before anything else |
-| `vehicle_id`, `device_sn` | auto | your vehicle id + device serial — **`setup.py` fills these for you** |
-| `vehicle` | auto | `{plate, model, vin}` — auto-detected; UI hides plate+VIN by default |
-| `battery_kwh`, `wltp_kwh_100` | | usable pack size + WLTP reference. **The car never reports pack size**, so it comes from you or from the [known-cars table](#known-cars); an unrecognised model is asked at setup and labelled *assumed* in the UI until you set it. It scales every kWh, cost and efficiency figure |
-| `currency` | | `{symbol, locale, code}` for non-IDR countries, e.g. `{"symbol":"R","locale":"en-ZA","code":"ZAR"}`. Default `Rp` / `id-ID` |
-| `tariff`, `petrol_price`, `petrol_kml` | | your local charging tariff/kWh + petrol price/L + economy, in your currency |
-| `tyre_unit` | | `psi` (default), `bar`, or `kpa` for the tyre display |
-| `tpms_scale` | | raw tyre-byte → kPa scale. J5 is indirect (no real PSI); cars that send real pressure need this recalibrated (see below) |
-| `car_image` | auto | override for the dashboard hero picture. Normally unnecessary — `setup.py` saves the render CarLinko hosts of *your* car (right model, right colour) and the server caches it at `/car-photo`. Set this to a filename in `web/` or a full URL only if you'd rather use your own photo |
-| `specs` | | brochure figures for the **Specifications** card — `{label, source, performance:[[name,value,unit]], dimensions:[…]}`. Only the J5's are bundled; any other model hides the card rather than showing another car's numbers, so fill this in if you want it |
-| `powertrain` | | `auto` (default), `bev` or `phev`. On `auto` the car is treated as a PHEV once it reports a fuel tank — a BEV never does, so this stays off unless it should be on |
-| `chemistry` | | `lfp` (default) or `nmc` — picks the battery-care advice |
-| `full_charge_days` | | how often to recommend a 100% charge. Default `7` for LFP, `90` for NMC |
-| `gmaps_key` | | Google Maps key — enables trip planner + SPKLU map (else OSM fallback) |
-| `dashboard_password` | | set it (login page → Advanced) to lock the dashboard behind a password — **do this if the URL is reachable from the internet** |
-
-> **Not in Indonesia? `setup.py` now asks.** It offers presets for Indonesia, South Africa, the UK
-> and the Eurozone (and lets you type any other currency), then asks for your charging tariff,
-> petrol price and tyre unit — so every cost on the dashboard is in your money without hand-editing
-> `creds.json`. Re-run `python setup.py` any time to change them; it keeps your existing values.
-> The trip planner + charge map remain Indonesia-only (they use SPKLU/PLN data).
->
-> Bundled prices are a *starting point* and go stale — Indonesian defaults are Pertamax at
-> Rp16,250/L and PLN SPKLU at Rp2,540/kWh (Jul 2026). Set `petrol_price` / `tariff` to yours.
-
-> **`tariff_idr` is the old name for `tariff`** — still read, so existing configs keep working, but
-> prefer `tariff` now that costs aren't Indonesia-only.
->
-> **Tyre pressure is now calibrated for you.** CarLinko publishes the per-model tyre formula
-> (`appKpaFormula`, e.g. `data * 1.373`), so `setup.py` reads your car's own scale straight off the
-> API — no hand-calibration. If you've already set `tpms_scale` yourself, setup keeps your value and
-> just mentions what CarLinko says; delete the key to adopt theirs. Pick the display unit with
-> `tyre_unit` (`psi`/`bar`/`kpa`).
->
-> If the numbers still look wrong, the tyre card shows the **raw bytes** — read one wheel off your
-> car's own screen and `tpms_scale = your_kPa / raw_byte`. Note that some cars (the J5 included)
-> have *indirect* TPMS and report tyre **status only**, never a real pressure.
-
-### Known cars
-
-Settings other owners have confirmed. Please add yours via a
-[compatibility report](https://github.com/GodrezJr2/j5-ev-dashboard/issues/new?template=compatibility.md).
-
-These are **applied automatically** from your detected model — the table lives in
-[`tools/known_cars.py`](tools/known_cars.py), and anything you set in `creds.json` still wins.
-
-| Car | `battery_kwh` | `tpms_scale` | `tyre_unit` | Notes |
-| --- | --- | --- | --- | --- |
-| Jaecoo J5 EV (ID) | `58.9` | n/a | `psi` | Reference car. *Indirect* TPMS — reports tyre **status only**, never a pressure |
-| Chery Tiggo 8 PHEV 2025 (ZA) | `18.3` | `1.779` | `bar` | Direct TPMS (raw `136` = 2.42 bar). PHEV — fuel level, fuel consumption and fuel range all decoded ([#2](https://github.com/GodrezJr2/j5-ev-dashboard/issues/2)) |
-| Chery Tiggo 7 PHEV (MY) | `18.3` | `1.779` | `psi` | Same pack and tyre scale as the Tiggo 8 PHEV, independently confirmed ([#3](https://github.com/GodrezJr2/j5-ev-dashboard/issues/3)). Malaysia badges it **`TIGGO 7 CSH`** — matched automatically |
-| Omoda E5 2025 (UY) | `61` | — | — | LFP, WLTP 15.5 kWh/100 km — owner-confirmed ([#5](https://github.com/GodrezJr2/j5-ev-dashboard/issues/5)). Everything works incl. login, auto-detect and charging |
-
-**If your car isn't listed**, nothing is invented on your behalf: `setup.py` asks for the pack size,
-the battery card labels it *assumed* until you set it, and the spec card stays hidden rather than
-showing another car's brochure figures.
-
-**PHEVs.** Fuel tank % (byte 21), fuel consumption L/100 km (byte 53) and **fuel range**
-(bytes 70–71) are decoded and shown next to the battery. Those bytes read `0` on every BEV frame, so
-BEV owners see no fuel UI. `range_km` stays strictly **EV-only** and is labelled *EV range* on a
-PHEV; the combined figure the car's own dash shows is **not transmitted** — it is exactly EV + fuel
-(verified on three captures), so the app computes it and says so rather than passing it off as the
-car's number. Because a PHEV also covers distance on petrol, kWh/100 km and savings-vs-petrol are
-approximate on one.
-
-## Where to run it
-
-It needs a host that's on **24/7** (the logger polls continuously to build trends and charge
-history). **A phone alone won't do it** — iOS can't run a background server at all, and Android
-(Termux) gets killed by battery management. So the host runs elsewhere and your phone is just the
-browser (add it to your home screen as a PWA).
-
-| Host | Cost | Notes |
-| --- | --- | --- |
-| A spare PC / old laptop / **Raspberry Pi** at home | free | best privacy; reach it over [Tailscale](https://tailscale.com) |
-| A small **VPS** (Hetzner, Contabo, DigitalOcean…) | ~$4/mo | easiest always-on; keep it private with Tailscale, or set a `dashboard_password` |
-| **Fly.io / Railway / Render** free tier | free | deploy the Docker image; set a `dashboard_password`. A host that gives you one service and one volume can run the logger alongside the dashboard with the start command `bash railway_start.sh` (see below) |
-| **Oracle Cloud Free / Google e2-micro** | free | always-on free VM |
-
-> **Public hosting = set a dashboard password.** On a private/home/Tailscale host you can leave it
-> open. The moment the URL is reachable from the internet, set a `dashboard_password` (login page →
-> Advanced) so only you can open the dashboard.
-
-> **One service, both processes.** `docker compose` runs the dashboard and the logger as two
-> services sharing `./data`. A host that attaches a volume to a *single* service (Railway) can't
-> do that, so `tools/railway_start.sh` starts the logger in the background and the dashboard in
-> the foreground from one container. Set it as the service's start command —
-> `bash railway_start.sh` — and put the contents of `creds.json` in a `CREDS_JSON` service
-> variable; the script writes it into the volume on every boot. It is deliberately **not** the
-> image's default: CarLinko allows one live session per account, so a `docker run` that quietly
-> started a logger would knock your own CarLinko app offline.
-
-### Per-OS setup
-The Docker path is identical on every OS — install Docker, then `docker compose up -d` and open
-`http://localhost:8088`:
-- **macOS / Windows**: install [Docker Desktop](https://www.docker.com/products/docker-desktop/), open it, then run the two commands in Terminal / PowerShell from the cloned repo folder.
-- **Linux**: `sudo apt install docker.io docker-compose-plugin` (or your distro's equivalent), then the same two commands.
-
-No Docker? Install **Python 3.10+** ([python.org](https://www.python.org/downloads/) on macOS/Windows, `sudo apt install python3 python3-pip` on Linux) and use the *Quick start — Python* steps above.
-
-### Updating a self-hosted box
-
-When a client asks for a newer dashboard, update this server's checkout and restart its service.
-The public `/api/status` response reports the same `api_version` as `/api/summary`,
-plus supported `capabilities`. See the
-[status contract](docs/api-map.md#public-status-and-capabilities--apistatus) for their meanings.
-After updating, reopen the client or use its retry action to check again. Maintainers can use
-the [release flow](docs/releasing.md) to prepare and check a tagged source release.
-
-**Docker:** `git pull && docker compose up -d --build`.
-
-**systemd** (the layout `tools/install.sh` sets up: the units run out of a git checkout). Push your
-commits, then from your own machine:
+Keep `./data` and `.env`; they hold the owner's state and push settings. From the dashboard checkout:
 
 ```bash
-./tools/deploy.sh user@host          # or set CARLINKO_HOST; an ssh alias works too
+git fetch origin --tags
+git switch main
+git pull --ff-only origin main
+docker compose --profile push up -d --build   # use if push alerts are enabled
+docker compose ps
+curl https://your-dashboard.example/api/status
 ```
 
-It refuses if you have unpushed commits or dirty tracked files, fast-forwards the checkout on the
-box, then runs `tools/apply.sh` there: restarts only the units whose code changed (web-only edits
-need none), checks `/api/status`, then fetches the changed pages back from the running server and
-compares them with the repo. So "deployed" means "being served", not just "a file landed". Set
-`CARLINKO_DIR` (default `~/j5-ev-dashboard`), `CARLINKO_PORT`, `CARLINKO_BRANCH` or
-`CARLINKO_SERVICES` if your layout differs. Or run `tools/apply.sh` on the box itself. The
-maintainer's push-to-deploy pipeline is described in [docs/ci-cd.md](docs/ci-cd.md).
+If push is disabled, use `docker compose up -d --build` instead. Check `docker compose logs --tail=100 web logger push-dispatcher` for startup errors (omit `push-dispatcher` when disabled). If you run a tagged release, replace the `git switch main` and `git pull` lines with `git switch --detach release-X.Y.Z` after fetching tags, then rebuild with the same Compose command. Do not delete `./data` during an update.
 
-**Hosted Docker deployments (Railway, Render, Fly.io):** update the connected repository to the
-desired upstream release and trigger a fresh image build/deploy in the host's dashboard. Keep the
-existing data volume and environment configuration attached. Hosts that track a branch may
-redeploy automatically after a push; verify the running `/api/status` response instead of assuming
-that a completed source update restarted the container.
+App releases use tags such as `release-X.Y.Z+N`. A coordinated dashboard source release uses `release-X.Y.Z`, matching the app's **X.Y.Z** marketing version; the app's `+N` build number does not create another dashboard tag. An app-only build does not require a dashboard tag. The dashboard's HTTP `api_version` and advertised `capabilities` describe client compatibility independently of Git tags. Maintainers: see [release procedure](docs/releasing.md).
 
-### Set it up with an AI coding agent
-If the terminal isn't your thing, paste this into an AI coding agent (Claude Code, Cursor, etc.)
-running on the machine that will host it:
+### Prompt for an AI setup or update agent
+
+Copy this into an AI coding agent with access to **your dashboard checkout and Docker host**. Tell it whether this is a first setup or an update, and provide a target `release-X.Y.Z` tag if you use tagged releases:
 
 ```text
-Set up the open-source project https://github.com/GodrezJr2/j5-ev-dashboard on this machine.
-Clone it, then bring it up with Docker (docker compose up -d). It serves a login page on
-http://localhost:8088 — tell me the URL when it's running. I'll enter my CarLinko email and
-password there myself; do not ask me for them. If Docker isn't available, fall back to the
-Python quick-start in the README (pip install requests websocket-client, then run
-tools/server.py and tools/logger.py). If the host is reachable from the internet, remind me to
-set a dashboard password on the login page's Advanced section.
+Set up or update my personal J5 EV Dashboard in this checkout. This is a
+[first setup / update]. My target is [main / release-X.Y.Z].
+
+Read README.md, docker-compose.yml, and the relevant installation and update
+docs before changing anything. Inspect the current Git state and running
+containers. Preserve local changes, ./data, and .env; never delete or replace
+owner data. On updates, back up ./data and .env (if present) to a private
+directory outside the checkout first, then fetch the target, rebuild, and
+restart the existing Compose services.
+If local changes block the update, explain the conflict before changing them.
+
+For first setup, start the web and logger services and tell me where to open
+the dashboard. Let me enter CarLinko credentials and set a dashboard password
+in the dashboard UI; never ask me to paste secrets into chat or commit them.
+If I want Voltmoss push alerts, first confirm my dashboard has a public HTTPS
+URL and a dashboard password. Set VOLTMOSS_PUSH_HTTPS=1 and
+VOLTMOSS_PUSH_DISPATCHER=1 in the private .env file, then start the Compose
+push profile. The app and dashboard use the fixed relay at
+https://push-relay-production-149c.up.railway.app; do not deploy a relay or
+ask for Firebase credentials on this host.
+
+Finish by checking docker compose ps, relevant service logs, and /api/status.
+If push is enabled, also check that push_alerts is advertised and ask me to
+unlock the dashboard in Voltmoss to confirm /api/push/status is enabled.
+Report the version deployed, the dashboard URL, what you verified, and any
+remaining step that needs my input. Do not print credentials or tokens.
 ```
 
-## Going multi-user
+## Other installation options
 
-This is intentionally **single-tenant per instance**. The clean way to let other owners use
-it is to have **each of them run their own instance** with their own `creds.json` — not to
-host one service holding everyone's credentials. Different models can override
-`battery_kwh` / `wltp_kwh_100` / `tariff_idr`, and the vehicle name/VIN/plate come from
-`creds.json`, so the app already adapts per car.
+- Windows without Docker: download the repository ZIP and run `start.bat`.
+- Linux systemd: `./tools/install.sh` installs the dashboard and logger for the current user; `--tailscale` adds private remote access.
+- Manual Python: install `requests` and `websocket-client`, then run `tools/setup.py`, `tools/logger.py --adaptive` and `tools/server.py 8088` from `tools/`.
+- Railway or a single-container host: use `bash railway_start.sh` as the service start command and a persistent `/data` volume. See [deployment notes](docs/ci-cd.md). Details for every option: [install options](docs/installation.md) and [hosting](docs/operations.md).
 
-## Project layout
-- `tools/` — Python backend (`server.py`, `logger.py`, `auth.py`) + reverse-engineering utilities
-- `web/` — the PWA (single `index.html` + vendored `leaflet.*`, `slot-text.js`)
-- `docs/` — API map and decompiled signing notes (secrets redacted)
-- `PRODUCT.md`, `DESIGN.md` — product + visual design notes
+## Safety and documentation
 
-## Contributing
-Other Jaecoo / CarLinko owners welcome — a [compatibility report](https://github.com/GodrezJr2/j5-ev-dashboard/issues/new?template=compatibility.md)
-(does it work on your car/region?) is the most useful thing right now. See
-[CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) for privacy/security.
-Questions → [Discussions](https://github.com/GodrezJr2/j5-ev-dashboard/discussions).
+This project accesses **your own car and account** through an undocumented CarLinko API. It is unaffiliated with Jaecoo, Chery and CarLinko; vendor changes can break it. Do not run one dashboard as a public multi-user service or put other owners' credentials in it. Each owner should deploy their own instance. Public dashboards need HTTPS and a password. [Legal and privacy](docs/safety-privacy.md) and [SECURITY.md](SECURITY.md) have the full guidance.
 
-## License
-[MIT](LICENSE). Not affiliated with Jaecoo, Chery, or CarLinko. Trademarks belong to their owners.
+[Features and screenshots](docs/features.md) · [Install options](docs/installation.md) · [Hosting, updates and logs](docs/operations.md) · [Legal and privacy](docs/safety-privacy.md) · [Architecture](docs/architecture.md) · [Configuration and known cars](docs/configuration.md) · [Accuracy notes](docs/accuracy.md) · [API map](docs/api-map.md) · [Home Assistant](docs/HOMEASSISTANT.md) · [Product notes](PRODUCT.md) · [Design notes](DESIGN.md) · [License](LICENSE)

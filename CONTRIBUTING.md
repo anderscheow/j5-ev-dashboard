@@ -17,12 +17,12 @@ their own vehicle.
   us which byte offsets and assumptions hold beyond the J5.
 - **Fix a telemetry offset** for a different model (battery / range / odometer live at fixed byte
   positions in `tools/server.py` → `decode()`; they may differ on other cars).
-- **Improve a translation** (`README.id.md`, or UI strings in `web/index.html`).
+- **Improve a translation** (`README.id.md`, `README.zh-CN.md`, `README.ms.md`, the matching `docs/<lang>/` pages, or UI strings in `web/index.html`).
 - **Docs / setup friction** — anything that tripped you up is probably tripping up others.
 
 ## Before you start
 
-- Skim **[README.md](README.md)** (architecture + setup) and **[docs/api-map.md](docs/api-map.md)**
+- Skim **[README.md](README.md)** (overview + setup) and **[docs/api-map.md](docs/api-map.md)**
   (the reverse-engineered API).
 - Try **demo mode** to explore the UI without an account: `cd tools && python server.py --demo`.
 

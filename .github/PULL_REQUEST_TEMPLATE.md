@@ -31,7 +31,7 @@ The whole point of this project is that the numbers are true, so decoding change
 - [ ] Anything uncertain is described as uncertain, in the code comment and the UI
 - [ ] Existing cars still work — this doesn't assume everyone drives what I drive
       (defaults still sane for a BEV, for Indonesia, for indirect TPMS, etc.)
-- [ ] Docs updated if behaviour or config changed (`README.md`, `README.id.md`,
+- [ ] Docs updated if behaviour or config changed (`README.md`, its `README.*.md` translations and `docs/<lang>/`,
       `creds.example.json`, `docs/api-map.md`)
 
 ## Screenshots

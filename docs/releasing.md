@@ -6,10 +6,25 @@ summary field is removed, renamed, or changes type, units, or meaning. New
 operations are listed in `/api/status` `capabilities` without a version bump.
 Git `release-X.Y.Z` tags identify source releases and are not sent to clients.
 
+## Align with Voltmoss app versions
+
+Voltmoss app tags use `release-X.Y.Z+N`: `X.Y.Z` is the app's marketing
+version and `N` is its store build number. For a coordinated dashboard change,
+tag the dashboard source `release-X.Y.Z` for the app marketing version it
+supports. Do not copy `+N` into a dashboard tag and do not create another
+dashboard tag for an app-only build increment. A dashboard-only fix may advance
+its own patch version; never move or reuse a published tag.
+
+This is a release naming convention, not an HTTP compatibility check. The
+app must still inspect `/api/status` `api_version` and `capabilities`. If a
+dashboard release adds, changes or removes a capability, update the server
+contract and app mapping before coordinating the release.
+
 ## Prepare
 
 Work on `feat/carlinko-device-endpoints`, with the intended changes present.
-Choose a tag greater than all previous `release-*` tags:
+Choose a tag consistent with the rule above and greater than all previous
+dashboard `release-*` tags:
 
 ```bash
 python3 tools/release.py prepare release-X.Y.Z
@@ -47,7 +62,7 @@ static checks, and HTTP status tests, then creates an annotated local tag.
 Inspect and push the reviewed branch and tag to the intended remote. Publish
 and deploy separately.
 
-For self-hosted deployments, follow the [README update instructions](../README.md#updating-a-self-hosted-box).
+For self-hosted deployments, follow the [README update instructions](../README.md#update-when-a-dashboard-release-is-published).
 After deployment, check the running public contract against the tagged source:
 
 ```bash

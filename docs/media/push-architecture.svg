@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="640" viewBox="0 0 1600 640" role="img" aria-labelledby="title description">
+  <title id="title">Voltmoss push architecture</title>
+  <desc id="description">The phone registers its Firebase installation ID and dashboard URL with the Voltmoss relay, then gives the relay-issued installation ID and secret to its own Docker dashboard. The dashboard processes CarLinko telemetry and sends matching alerts to the relay, which delivers them through FCM and APNs to the phone.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#10172c"/><stop offset="1" stop-color="#16233d"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#b8c7e3" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#7fe0bb" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #edf3ff; }
+      .title { font-size: 31px; font-weight: 700; }
+      .subtitle { font-size: 16px; fill: #aab9d4; }
+      .section { font-size: 15px; font-weight: 700; letter-spacing: 1.6px; fill: #9db2d3; }
+      .name { font-size: 21px; font-weight: 700; }
+      .detail { font-size: 15px; fill: #b8c8e1; }
+      .label { font-size: 15px; font-weight: 600; fill: #dce8ff; }
+      .small { font-size: 14px; fill: #b8c8e1; }
+      .panel { fill: #1c2a45; stroke: #3d5478; stroke-width: 2; }
+      .phone { fill: #203450; stroke: #67b7ed; stroke-width: 2; }
+      .docker { fill: #213b43; stroke: #74d4bf; stroke-width: 2; }
+      .relay { fill: #3b3155; stroke: #ba9cfa; stroke-width: 2; }
+      .cloud { fill: #36405a; stroke: #b5c6e6; stroke-width: 2; }
+      .flow { fill: none; stroke: #b8c7e3; stroke-width: 2.5; marker-end: url(#arrow); }
+      .delivery { fill: none; stroke: #7fe0bb; stroke-width: 3; marker-end: url(#arrowGreen); }
+    </style>
+  </defs>
+  <rect width="1600" height="640" rx="22" fill="url(#background)"/>
+  <text x="42" y="54" class="title">Push notifications: one relay, one dashboard per owner</text>
+  <text x="42" y="82" class="subtitle">Registration stays on the phone; alert decisions stay on the owner’s server.</text>
+
+  <text x="42" y="122" class="section">REGISTRATION · WHEN AN ELIGIBLE ALERT IS ENABLED</text>
+  <rect x="42" y="145" width="270" height="120" rx="18" class="phone"/>
+  <text x="67" y="186" class="name">Voltmoss app</text>
+  <text x="67" y="212" class="detail">Phone · FCM installation ID</text>
+  <text x="67" y="237" class="detail">App Check attestation</text>
+  <rect x="548" y="145" width="320" height="120" rx="18" class="docker"/>
+  <text x="573" y="186" class="name">Standalone dashboard</text>
+  <text x="573" y="212" class="detail">Owner’s Docker web server</text>
+  <text x="573" y="237" class="detail">HTTPS + dashboard password</text>
+  <rect x="1097" y="145" width="460" height="120" rx="18" class="relay"/>
+  <text x="1122" y="186" class="name">Voltmoss push relay</text>
+  <text x="1122" y="212" class="detail">One centrally operated service</text>
+  <text x="1122" y="237" class="detail">Registrations, queue, Firebase send authority</text>
+  <path d="M312 177 H548" class="flow"/>
+  <text x="332" y="164" class="label">1 · Connect / unlock</text>
+  <path d="M312 231 H548" class="flow"/>
+  <text x="334" y="253" class="label">4 · Rules + ID + secret</text>
+  <path d="M312 145 V136 H1097 V145" class="flow"/>
+  <text x="635" y="130" class="label">2 · FCM ID + dashboard URL + App Check</text>
+  <path d="M1097 265 V294 H312 V265" class="flow"/>
+  <text x="635" y="288" class="label">3 · Installation ID + scoped secret</text>
+
+  <path d="M42 326 H1557" stroke="#405473" stroke-width="1.5"/>
+  <text x="42" y="356" class="section">DELIVERY · WHEN THE CAR REPORTS A MATCHING CONDITION</text>
+  <g>
+    <rect x="42" y="388" width="176" height="113" rx="16" class="cloud"/>
+    <text x="60" y="427" class="name">CarLinko</text><text x="60" y="454" class="detail">Car telemetry</text>
+    <rect x="254" y="388" width="176" height="113" rx="16" class="docker"/>
+    <text x="272" y="427" class="name">Logger</text><text x="272" y="454" class="detail">Docker service</text>
+    <rect x="466" y="388" width="176" height="113" rx="16" class="docker"/>
+    <text x="484" y="427" class="name">SQLite</text><text x="484" y="454" class="detail">Telemetry DB</text>
+    <rect x="678" y="388" width="176" height="113" rx="16" class="docker"/>
+    <text x="696" y="427" class="name">Dispatcher</text><text x="696" y="454" class="detail">Rules + outbox</text>
+    <rect x="890" y="388" width="176" height="113" rx="16" class="relay"/>
+    <text x="908" y="427" class="name">Relay</text><text x="908" y="454" class="detail">Event queue</text>
+    <rect x="1102" y="388" width="176" height="113" rx="16" class="cloud"/>
+    <text x="1120" y="427" class="name">FCM / APNs</text><text x="1120" y="454" class="detail">Push delivery</text>
+    <rect x="1314" y="388" width="243" height="113" rx="16" class="phone"/>
+    <text x="1332" y="427" class="name">Installed app</text><text x="1332" y="454" class="detail">Owner receives alert</text>
+  </g>
+  <path d="M218 445 H254" class="delivery"/><path d="M430 445 H466" class="delivery"/><path d="M642 445 H678" class="delivery"/><path d="M854 445 H890" class="delivery"/><path d="M1066 445 H1102" class="delivery"/><path d="M1278 445 H1314" class="delivery"/>
+  <rect x="42" y="542" width="1515" height="62" rx="14" class="panel"/>
+  <text x="62" y="568" class="label">Deployment boundary</text>
+  <text x="62" y="590" class="small">Each owner runs the web server, logger and dispatcher in Docker. Voltmoss runs one relay. The relay stores the dashboard URL but never polls it.</text>
+</svg>
