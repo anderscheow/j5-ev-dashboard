@@ -368,9 +368,67 @@ KNOWN_OPCODES = [
     {"code": "77",   "note": "captured"},
 ]
 
+def _user_id():
+    """CarLinko numeric account id, needed inside the encrypted control frame. Cached in creds.json."""
+    c = _creds()
+    uid = c.get("user_id")
+    if uid:
+        return str(uid)
+    import auth, requests
+    def _fetch(tok):
+        # returns (id_or_None, token_was_stale)
+        try:
+            r = requests.get(auth.api_base() + "/user/info",
+                             headers=auth.headers_for({}, token=tok), timeout=15).json()
+            if str(r.get("code")) in ("9997", "40001", "40003", "401", "1001", "1002"):
+                return None, True
+            return (r.get("data") or {}).get("id"), False
+        except Exception:
+            return None, False
+    uid, stale = _fetch(_read_token())
+    if not uid and stale:            # expired token -> relogin once (same as send_control does)
+        try:
+            uid, _ = _fetch(auth.login())
+        except Exception:
+            uid = None
+    if uid:
+        c["user_id"] = str(uid)
+        try:
+            _save_creds(c)
+        except Exception:
+            pass
+    return str(uid or "")
+
+def _control_data(opcode):
+    """74xx actuation commands must be AES-encrypted: the CarLinko T-Box firmware (>= 2.3.1_051A01R,
+    ~Nov 2026) rejects a plain 74xxyy frame with a bare '__7404'. Init commands (2301/24/77) stay
+    plain. The scheme (reversed from app 1.14.10) lives in carlinko_crypto; it embeds VIN + userId.
+
+    GATED to the models whose owner has live-verified it, because a wrong frame is worse than a clean
+    reject: the Jaecoo J5 EV (upstream) and this Tiggo 7 CSH (2026-11-13 -- 741001 encrypted came
+    back '__74100100' and the A/C switched, while plain '741001' got '__7404'). Widen the predicate
+    once another model is tested; do not drop the gate blind."""
+    if not opcode.lower().startswith("74"):
+        return opcode
+    v = _creds().get("vehicle") or {}
+    vin = (v.get("vin") or "")
+    model = (v.get("model") or "").lower()
+    verified = ("j5" in model) or ("tiggo 7 csh" in model) or vin.upper().startswith("MF7HD27B")
+    if not verified:
+        return opcode   # unverified model -> old plain path, do not risk a wrong frame
+    try:
+        import carlinko_crypto
+        uid = _user_id()
+        if vin and vin != "—" and uid:
+            return carlinko_crypto.build_control_payload(opcode, vin, uid)
+    except Exception as e:
+        import sys; print("control encrypt failed:", e, file=sys.stderr)
+    return opcode   # fall back to plain (fails visibly with __7404) rather than crash
+
 def send_control(opcode, timeout=20):
     """Forge the exact POST /user/vehicle/remoteControl the app sends. timeOut is signed as a
-    NUMBER (not a string) to match the app's jsonEncode, else the server rejects the signature."""
+    NUMBER (not a string) to match the app's jsonEncode, else the server rejects the signature.
+    A 74xx actuation is AES-encrypted first (see _control_data); init commands go plain."""
     import auth, requests
     c = _creds()
     vid = str(c.get("vehicle_id") or getattr(auth, "VEHICLE_ID", "") or "")
@@ -379,7 +437,7 @@ def send_control(opcode, timeout=20):
         return {"code": "-1", "msg": "vehicle_id / device_sn missing from creds.json"}
     try: timeout = int(timeout)
     except Exception: timeout = 20
-    body = {"vehicleId": vid, "deviceSn": dsn, "data": str(opcode), "timeOut": timeout}
+    body = {"vehicleId": vid, "deviceSn": dsn, "data": _control_data(str(opcode)), "timeOut": timeout}
     def _post(tok):
         ts = auth.now_ms()
         ordered = {k: v for k, v in sorted({**body, "timestamp": ts}.items())}
@@ -423,6 +481,14 @@ def _ack_status(op, d):
 def control_result(op, d):
     """{ok, code, msg[, status, error]} for one send_control reply. `ok` needs the gateway's `0000`
     AND, for an echoed command, the car's `00` -- a `0000` carrying status `44` changed nothing."""
+    opu = str(op).upper()
+    tail = str(d.get("data") or "").rsplit("__", 1)[-1].upper()
+    # A bare 2-byte '74RR' reply (seen live: '7404') is the T-Box rejecting the command FRAME --
+    # not an echo with a status byte, so _ack_status reads None and the gateway's own code is 0000.
+    # Report it as a refusal straight away instead of polling 18 s for a change that cannot come.
+    if opu.startswith("74") and len(opu) == 6 and tail.startswith("74") and len(tail) == 4:
+        return {"ok": False, "code": d.get("code"), "msg": d.get("msg"), "status": tail[2:4],
+                "error": "the car rejected the command (0x%s)" % tail[2:4]}
     st = _ack_status(op, d)
     res = {"ok": str(d.get("code")) == "0000" and st in (None, "00"),
            "code": d.get("code"), "msg": d.get("msg")}
