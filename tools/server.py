@@ -390,12 +390,26 @@ def send_control(opcode, timeout=20):
         return requests.post(auth.api_base() + "/user/vehicle/remoteControl",
                              data=json.dumps(body, separators=(",", ":"), ensure_ascii=False),
                              headers=h, timeout=timeout + 8).json()
+    t0 = time.time()
     d = _post(_read_token())
     # stale token -> relogin once. 9997 = 登录失效 (login expired), the one CarLinko actually returns.
-    if str(d.get("code")) in ("9997", "40001", "40003", "401", "1001", "1002"):
+    relogin = str(d.get("code")) in ("9997", "40001", "40003", "401", "1001", "1002")
+    if relogin:
         try: d = _post(auth.login())
         except Exception as e: d = {"code": "-1", "msg": f"relogin failed: {e}"}
+    LOG.info("control %s -> code=%s reply=%s msg=%s in %d ms%s", opcode, d.get("code"),
+             _reply_tail(d), str(d.get("msg") or "")[:60], (time.time() - t0) * 1000,
+             " (after relogin)" if relogin else "")
     return d
+
+def _reply_tail(d):
+    """The gateway's reply payload for the log, without the device serial it is prefixed with
+    (`<sn>__7411AC00`). A payload with no `__` separator is reported by length only."""
+    data = d.get("data")
+    if data in (None, ""):
+        return "none"
+    data = str(data)
+    return data.rsplit("__", 1)[-1][:48] if "__" in data else "len=%d" % len(data)
 
 def _ack_status(op, d):
     """Status byte of a command ack. For a 74xx/78xx command CarLinko echoes the opcode and appends
