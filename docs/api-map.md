@@ -387,6 +387,70 @@ deletes the binding and its queued events rather than retrying. Time-zone
 validation uses Python's `zoneinfo`; the image installs the `tzdata` package so
 it does not depend on the base image shipping a system time-zone database.
 
+### `/api/stream` — realtime summary (Server-Sent Events, since 2026-11-03)
+
+`GET /api/stream` answers `text/event-stream`. Each `data:` event is a complete `/api/summary`
+payload (same shape, same `api_version`), so a client can swap it in exactly as it would a polled
+summary. Same auth gate as `/api/summary`.
+
+- One watcher thread in `server.py` checks the newest `telemetry` row every **1 s** and publishes a
+  new summary only when the stored frame (`raw`) changed. The logger stores each frame the car
+  pushes the moment it lands, so a lock/unlock or A/C change reaches every open tab about a second
+  after the car reports it.
+- An unchanged summary is re-sent every **30 s** (keeps "updated x ago" honest) and an SSE comment
+  `: ping` every **15 s** keeps proxies (tailscale serve / funnel) from closing an idle stream.
+- N open tabs cost one DB check per second, not N polls. `retry: 3000` tells the browser to
+  reconnect after 3 s.
+- v2 uses it and falls back to polling (15 s home, 4 s Doors / Climate) only while the stream is
+  down; it closes the stream when the tab is hidden and reopens it on return.
+
+### `/api/control` — the car's own verdict (since 2026-11-03)
+
+`POST /api/control {data, timeOut}` returns `{ok, code, msg, result, reason}`.
+
+CarLinko's `code: "0000"` only means the command **reached the T-Box**. The car's answer is in the
+reply's `data`, as `<deviceSn>__74<CMD><STATE><RESULT>`:
+
+| `RESULT` | Meaning |
+|---|---|
+| `00` | done |
+| anything else | the car refused; `ok` is `false` |
+
+So `ok` is now `true` only when the cloud accepted **and** the car answered `00`; before this,
+`ok` was `true` on `0000` alone and a refused A/C still toasted "A/C is on". `result` is the raw
+byte, `reason` a human text where one is known. For A/C (`CMD 0x10`) the codes come from the app's
+`vehicle_control_response_handle.dart`, texts from its `assets/i18n/module_en.json`:
+
+| Code | Reason | Code | Reason |
+|---|---|---|---|
+| `2A` | vehicle in motion | `96` | key detected inside the car |
+| `93` | not in remote mode | `22` | a door is unlocked |
+| `23` | vehicle is started | `99` | T-Box authentication failed |
+| `94` | high-voltage fault | `9A` | not in P |
+| `95` | battery too low | `9B` | hazard lights are on |
+
+Other commands report `Car refused (code 0x..)` until their branches are mapped. Seen live
+2026-11-03: `741001` → `…__74100196` (key inside, owner at the car), `740100` → `…__74010000`.
+
+**In this fork** the same reply also carries the names it had before the upstream sync, so one
+client can speak to either server: `status` is the same byte as `result` (and is also read off a
+`78xx` echo, which upstream reports no verdict for), and `error` is the fork's own sentence for a
+refusal beside upstream's `reason`. `ok` is decided as before (`control_result` in
+`tools/server.py`). `confirmed: true` is added when the car answered `00`; it is left out
+otherwise, because `confirm: true` calls already use `confirmed` for the body-state read-back.
+`/api/actemp` and `/api/seat` answer with the same fields. Nothing was removed or renamed, so
+`api_version` stays 2.
+
+### `login_guard` and `POST /api/relogin` (since 2026-11-10)
+
+`/api/summary` carries `login_guard`: `null` while automatic CarLinko logins are allowed, else
+`{"blocked": bool, "wait": seconds or null, "reason": text}` — why the car stopped updating
+(`auth.login_status()`). It is stamped on every answer, outside the fork's shared summary cache,
+and is `null` in demo. `POST /api/relogin` (JSON body, dashboard session required) makes one
+guarded login attempt on the owner's behalf — it skips the backoff and a block but still counts
+against the hourly cap — and answers `{ok, error, login_guard}`. Neither has a capability ID:
+a client tells by the field being present and by the route answering.
+
 ---
 
 ## Standalone access — VALIDATED ✅

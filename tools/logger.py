@@ -195,7 +195,7 @@ def poll_once(conn, _retried=False):
                     TOKEN = auth.login()
                     LOG.info("got fresh token, retrying poll")
                     return poll_once(conn, _retried=True)
-                except Exception as e:
+                except Exception as e:                     # incl. auth.LoginWait (guard backoff)
                     _failure("self-login failed", e)
                     return None
             LOG.error("login failed after refresh (code %s)", _vendor_code(login))
@@ -309,7 +309,10 @@ STREAM_BACKSTOP = int(_C.get("stream_backstop") or 20)  # re-request action:6 th
                                                         # safety net for a missed push (pushes do the work)
 TOUCH           = 30  # re-store the last frame at least this often so a parked car still reads
                       # "live · <30s ago" even when nothing changes and nothing is pushed
-RECONNECT_WAIT  = 3   # backoff before reopening a dropped socket
+RECONNECT_WAIT  = 3   # first backoff before reopening a dropped socket; doubles per failure in a row
+RECONNECT_MAX   = 120 # cap for that backoff
+HEALTHY_SESSION = 120 # a socket that lived this long resets the backoff
+GUARD_POLL      = 5   # while the login guard holds: re-read its local state file this often
 
 def _store_blob(conn, blob):
     ts = int(time.time()); dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
@@ -330,11 +333,11 @@ def _stream_session(conn):
         if login.get("code") != "0000":                    # token expired -> self-login, as poll_once does
             LOG.warning("token invalid (code %s); retrying login", _vendor_code(login))
             import auth
-            TOKEN = auth.login()
+            TOKEN = auth.login()                           # guarded: may raise auth.LoginWait
             ws.send(json.dumps({"action": 1, "data": {"token": TOKEN, "vehicleId": VEHICLE}}))
             login = json.loads(ws.recv())
             if login.get("code") != "0000":
-                LOG.error("login failed after refresh (code %s)", _vendor_code(login)); return
+                raise RuntimeError("WS login refused with a fresh token (code %s)" % _vendor_code(login))
         ws.send(json.dumps({"action": 6}))                 # prime: pull the current frame immediately
         ws.send(json.dumps({"action": 0, "data": {"sn": SN}}))
         ws.settimeout(2)
@@ -375,12 +378,25 @@ def stream_loop(conn):
     reload_config()
     conn.executescript(SCHEMA)
     print(f"streaming to {os.path.abspath(DB)}  (push + {HEARTBEAT}s heartbeat, auto-reconnect)")
+    import auth
+    fails = 0
     while True:
+        started = time.time()
         try:
             _stream_session(conn)
+        except auth.LoginWait as e:
+            # The guard refused an automatic login. Don't touch the network until it allows one again
+            # (backoff over, or the owner pressed "try now" / logged in again on the dashboard). Only
+            # the local state file is read while waiting, so a blocked account gets zero traffic.
+            print(f"{e}; waiting without network")
+            while auth.login_status() is not None:
+                time.sleep(GUARD_POLL)
+            print("login guard clear, reconnecting")
+            continue
         except Exception as e:
             _failure("stream failed; reconnecting", e)
-        time.sleep(RECONNECT_WAIT)
+        fails = 0 if time.time() - started >= HEALTHY_SESSION else fails + 1
+        time.sleep(min(RECONNECT_WAIT * 2 ** max(fails - 1, 0), RECONNECT_MAX))
 
 def main():
     ap = argparse.ArgumentParser()

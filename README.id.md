@@ -75,6 +75,44 @@ Kalau push nonaktif, pakai `docker compose up -d --build`. Cek `docker compose l
 
 Rilis app memakai tag seperti `release-X.Y.Z+N`. Rilis sumber dashboard yang terkoordinasi memakai `release-X.Y.Z`, sesuai versi marketing **X.Y.Z** app; nomor build `+N` app tidak membuat tag dashboard baru. Build khusus app tidak butuh tag dashboard. `api_version` HTTP dan `capabilities` dashboard menjelaskan kompatibilitas klien secara terpisah dari tag Git. Maintainer: lihat [prosedur rilis](docs/releasing.md).
 
+## Risiko akun — baca dulu
+Dashboard ini **tidak resmi**: dia ngobrol ke cloud CarLinko dengan cara yang sama seperti app, tapi
+tanpa izin CarLinko. Di November 2026 ada user yang lapor akun CarLinko yang dipakai dashboard-nya
+**di-disable** ("Your account has been disabled"). Pemicunya belum diketahui. Akun apa pun yang
+kamu loginkan ke dashboard bisa kena hal yang sama, jadi pakai dengan risiko sendiri.
+
+Yang dilakukan dashboard supaya jejaknya kecil: satu socket yang terus terbuka (bukan polling), dan
+**login guard**: login ulang otomatis dibatasi 6x per jam, mundur dari 1 menit sampai 30 menit
+setelah gagal, dan berhenti total kalau CarLinko menolak akunnya (dashboard lalu menampilkan banner
+sampai kamu login ulang manual). Selalu update ke versi terbaru. Versi lama bisa mencoba login yang
+gagal setiap beberapa detik.
+
+## Add-on head unit: Climate Gesture
+Atur kipas dan suhu dari **mana aja di layar head unit** pakai dua jari, tanpa buka layar climate.
+Taruh dua jari sekitar sepertiga detik, lalu geser: ke samping = kipas (1 sampai 10), atas/bawah
+= suhu (15.5 sampai 30.5 °C). Ada kartu kecil yang nunjukin nilainya. Nyala sendiri tiap
+restart. Dites di Jaecoo J5 EV asli (head unit T13J-INTL 00.04.15, Android 12).
+
+**Panduan step-by-step plus gambar ada di dalam dashboard:** jalanin di laptop (Windows: file
+`start`, atau `python tools/server.py`), login, lalu **Account → Head unit add-ons**. Cuma mau
+add-on-nya? Ga perlu login CarLinko: tap **Only want the head unit add-on?** di halaman sign-in,
+atau buka `/addons`. Sekitar 10 menit, mobil parkir, tanpa kabel. Versi singkat:
+
+1. **Engineering menu** — di head unit *Settings → System → Version information*, tap
+   *APP Version* 10 kali, isi password = **6 digit terakhir SOC Version**.
+2. **Enable ADB** — nyalain di Engineering mode. Yang lain jangan disentuh.
+3. **Hotspot yang sama** — nyalain hotspot HP; head unit (*Connection → WiFi*) dan laptop konek ke situ.
+4. **Find dan install** — tap *Find head unit*, pilih, *Install*.
+5. **Coba** — dua jari, tahan, geser. Habis itu matiin lagi WiFi head unit (CarPlay / Android
+   Auto wireless ga jalan selama WiFi nyala); add-on tetap jalan.
+
+Ga perlu backup: cuma install app biasa, ga ada file sistem atau setting mobil yang berubah. Buat
+uninstall, buka app Climate Gesture lalu tap **Remove Climate Gesture**. Setelah terpasang, app ini
+nutup ADB lewat WiFi jadi device lain di jaringan ga bisa masuk head unit. **Ga resmi** — bukan dari
+Jaecoo atau Chery; update head unit bisa bikin ga jalan. Installer ngecek A/C dulu dan nolak head
+unit yang ga dikenal. Source: [headunit/climate-gesture](headunit/climate-gesture), APK:
+[headunit/dist](headunit/dist) (perintah `adb` manual ada di halaman add-ons).
+
 ## Opsi instalasi lain
 
 - Windows tanpa Docker: unduh ZIP repositori lalu jalankan `start.bat`.

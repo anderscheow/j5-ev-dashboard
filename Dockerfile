@@ -5,6 +5,7 @@ RUN pip install --no-cache-dir requests websocket-client tzdata
 
 COPY tools/ /app/tools/
 COPY web/  /app/web/
+COPY headunit/dist/ /app/headunit/dist/
 
 ENV CARLINKO_DATA=/data
 ENV PYTHONUNBUFFERED=1

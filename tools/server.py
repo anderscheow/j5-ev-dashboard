@@ -208,7 +208,7 @@ def web_login(email, password, region="sea", gmaps_key=None, dashboard_password=
     except Exception: pass
     import auth, requests
     auth._C = auth.cfg()
-    token = auth.login()                                   # writes token.txt; raises on bad creds
+    token = auth.login(manual=True)                        # writes token.txt; raises on bad creds; clears a block
     data = requests.get(auth.api_base() + "/user/vehicle",
                         headers=auth.headers_for({}, token=token), timeout=20).json().get("data")
     v = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
@@ -487,8 +487,9 @@ def control_result(op, d):
     # not an echo with a status byte, so _ack_status reads None and the gateway's own code is 0000.
     # Report it as a refusal straight away instead of polling 18 s for a change that cannot come.
     if opu.startswith("74") and len(opu) == 6 and tail.startswith("74") and len(tail) == 4:
-        return {"ok": False, "code": d.get("code"), "msg": d.get("msg"), "status": tail[2:4],
-                "error": "the car rejected the command (0x%s)" % tail[2:4]}
+        return _with_verdict(
+            {"ok": False, "code": d.get("code"), "msg": d.get("msg"), "status": tail[2:4],
+             "error": "the car rejected the command (0x%s)" % tail[2:4]}, op, d)
     st = _ack_status(op, d)
     res = {"ok": str(d.get("code")) == "0000" and st in (None, "00"),
            "code": d.get("code"), "msg": d.get("msg")}
@@ -496,6 +497,23 @@ def control_result(op, d):
         res["status"] = st
         if st != "00":
             res["error"] = "the car did not apply it (status %s)" % st
+    return _with_verdict(res, op, d)
+
+def _with_verdict(res, op, d):
+    """Upstream's names for the same verdict, beside this fork's `status`: `result` (the byte),
+    `reason` (the vendor app's words for a refusal) and `confirmed` (the car itself answered 00).
+    Additive -- `ok`, `status` and `error` are decided by the caller and are not changed here.
+    `confirmed` is written only when it is true: control_and_confirm() owns that key for a
+    confirm:true call (the body-state read-back), and a client that has always treated a missing
+    `confirmed` as "no read-back" must keep seeing it missing."""
+    reached = str(d.get("code")) == "0000"
+    _, byte, reason = control_verdict(op, d.get("data")) if reached else (False, None, None)
+    if byte is None:
+        byte = res.get("status")                           # a 78xx echo: upstream reads no verdict
+    res["result"] = byte
+    res["reason"] = reason
+    if reached and byte == "00":
+        res["confirmed"] = True
     return res
 
 # ---- climate opcodes: encoded and checked against the car's caps HERE, so no client builds bytes ----
@@ -1767,11 +1785,22 @@ def summary():
         state = _summary_inputs()
         cached = _summary_cache
         if cached and cached[0] == state and time.monotonic() - cached[1] < SUMMARY_TTL:
-            return copy.deepcopy(cached[2])
-        out = _summary()
-        out["api_version"] = API_VERSION
-        _summary_cache = (state, time.monotonic(), out)
-        return copy.deepcopy(out)
+            out = copy.deepcopy(cached[2])
+        else:
+            out = _summary()
+            out["api_version"] = API_VERSION
+            _summary_cache = (state, time.monotonic(), out)
+            out = copy.deepcopy(out)
+    # Stamped on each answer, outside the cache: the guard changes without any of the cached
+    # inputs changing (a refused CarLinko login touches none of those files).
+    out["login_guard"] = None                              # None = fine; else why updates stopped
+    if not DEMO:
+        try:
+            import auth
+            out["login_guard"] = auth.login_status()
+        except Exception:
+            pass
+    return out
 
 
 def _summary():
@@ -2560,6 +2589,77 @@ def trip_plan(frm, to, soc, cons, reserve=10.0, target=80.0, derate=1.0, a=None,
             "total_cost": round(sum(s["cost"] for s in stops)),
             "src": "google" if _gkey() else "osm"}
 
+# ---- realtime: /api/stream (Server-Sent Events) ----
+# The logger stores each frame the car pushes the moment it lands. One watcher thread looks at the
+# newest row once a second and rebuilds the summary only when the frame itself changed (the logger
+# also re-stores an unchanged frame every 30 s to keep "updated" fresh, so those get a slower beat).
+# Every open dashboard tab waits on the same condition, so N tabs cost one DB check, not N polls.
+STREAM_TICK = 1.0     # how often the watcher looks at the newest row
+STREAM_FRESH = 30     # re-send an unchanged summary this often so "Updated x ago" stays honest
+STREAM_PING = 15      # SSE comment so proxies (tailscale serve) keep an idle stream open
+_stream_cv = threading.Condition()
+_stream_state = {"seq": 0, "body": None, "started": False}
+
+def _latest_raw():
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    try:
+        r = conn.execute("SELECT raw FROM telemetry ORDER BY rowid DESC LIMIT 1").fetchone()
+        return r[0] if r else None
+    finally:
+        conn.close()
+
+def _stream_publish():
+    body = json.dumps(summary()).encode()
+    with _stream_cv:
+        _stream_state["seq"] += 1
+        _stream_state["body"] = body
+        _stream_cv.notify_all()
+
+def _stream_watch():
+    last_raw, last_pub = object(), 0.0
+    while True:
+        try:
+            raw = None if DEMO else _latest_raw()
+            if raw != last_raw or time.time() - last_pub >= STREAM_FRESH:
+                _stream_publish(); last_raw, last_pub = raw, time.time()
+        except Exception as e:
+            print("stream watcher:", repr(e)[:160])
+        time.sleep(STREAM_TICK)
+
+def _stream_start():
+    with _stream_cv:
+        if _stream_state["started"]:
+            return
+        _stream_state["started"] = True
+    threading.Thread(target=_stream_watch, name="stream-watch", daemon=True).start()
+
+# Car's own verdict on a command: the reply carries "<deviceSn>__74<CMD><STATE><RESULT>", where
+# RESULT 00 = done and anything else = the car refused (vehicle_control_response_handle.dart).
+# The cloud's code 0000 only means the command reached the T-Box.
+AC_REFUSALS = {   # the A/C branch of that handler; texts are the app's own module_en.json strings
+    "2A": "Vehicle in motion", "93": "Vehicle not in remote mode", "23": "Vehicle is started",
+    "94": "High-voltage fault", "95": "Battery too low", "96": "Key detected inside the car",
+    "22": "A door is unlocked", "99": "T-Box authentication failed", "9A": "Not in P",
+    "9B": "Hazard lights are on",
+}
+
+def control_verdict(op, data):
+    """(accepted, result_byte, reason) from the car's reply to a 74xxyy command."""
+    op = str(op).upper()
+    tail = str(data or "").split("__")[-1].upper()
+    # A bare 2-byte "74RR" reply (seen live: "7404") is the T-Box rejecting the command frame
+    # itself; the app's dispatcher only parses replies of 4+ bytes and shows controlSystemError.
+    if op.startswith("74") and len(op) == 6 and tail.startswith("74") and len(tail) == 4:
+        return False, tail[2:4], f"Car control system error (0x{tail[2:4]})"
+    if not op.startswith("74") or len(op) != 6 or not tail.startswith(op) or len(tail) < 8:
+        return True, None, None                      # not an actuation, or no verdict in the reply
+    res = tail[6:8]
+    if res == "00":
+        return True, res, None
+    reason = AC_REFUSALS.get(res) if op[2:4] == "10" else None
+    return False, res, reason or f"Car refused (code 0x{res})"
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # _send records the outcome; avoid BaseHTTPRequestHandler's duplicate line.
@@ -2598,11 +2698,60 @@ class H(BaseHTTPRequestHandler):
     def _authed(self):
         return (not _gated()) or valid_session(_cookie_sid(self.headers.get("Cookie")))
 
+    def _hu_local_ok(self):
+        """Head unit tools reach into this machine's LAN, so only a browser on that LAN may use them."""
+        import ipaddress
+        try:
+            ip = ipaddress.ip_address(self.client_address[0])
+            return ip.is_private or ip.is_loopback
+        except ValueError:
+            return False
+
+    def _head_unit(self, action):
+        import headunit
+        def reply(d, code=200):
+            self._send(code, json.dumps(d).encode(), "application/json")
+        if not self._authed():
+            return reply({"ok": False, "error": "auth"}, 401)
+        if DEMO:
+            return reply({"ok": False, "error": "Not available in demo mode."})
+        if not self._hu_local_ok():
+            return reply({"ok": False, "error": "Only from a browser on the same network as this dashboard."}, 403)
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return reply({"ok": False, "error": "JSON only"}, 415)   # forces a CORS preflight cross-site
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(min(n, 4096)).decode() or "{}")
+        except Exception:
+            return reply({"ok": False, "error": "bad request"}, 400)
+        ip = str(body.get("ip") or "").strip()
+        addon = str(body.get("addon") or "climate-gesture")
+        if addon not in headunit.ADDONS:
+            return reply({"ok": False, "error": "unknown add-on"}, 400)
+        if action != "scan" and not headunit.valid_ip(ip):
+            return reply({"ok": False, "error": "Enter the head unit's local IP, like 172.20.10.3."}, 400)
+        try:
+            if action == "scan":
+                d = headunit.scan(ip if headunit.valid_ip(ip) else None)
+                return reply({"ok": True, **d})
+            if action == "probe":
+                return reply({"ok": True, **headunit.probe(ip, addon)})
+            if action == "install":
+                steps = headunit.install(ip, addon)
+                return reply({"ok": all(s[1] for s in steps),
+                              "steps": [{"step": a, "ok": b, "detail": c} for a, b, c in steps]})
+        except OSError:                                # timeout / refused: nothing listening there
+            return reply({"ok": False, "error": "No answer from %s on port 5555. Is Enable ADB on, and is it on "
+                                                "this hotspot? If the add-on is installed, tap Open for 5 minutes in its app first." % ip})
+        except Exception as e:
+            return reply({"ok": False, "error": str(e)[:200]})
+        reply({"ok": False, "error": "unknown action"}, 404)
+
     def _set_cookie(self):
         return {"Set-Cookie": f"sid={make_session()}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL}"}
 
     # paths reachable without a session (so the login/unlock page can load + submit)
-    _PUBLIC = {"/login.html", "/icon.svg", "/manifest.webmanifest", "/api/status", "/api/login", "/api/unlock"}
+    _PUBLIC = {"/login.html", "/icon.svg", "/car-generic.svg", "/manifest.webmanifest", "/api/status", "/api/login", "/api/unlock"}
 
     def _replica(self, path):
         """GET /api/replica/telemetry?after=&limit= and /api/replica/files/{name}: what a
@@ -2651,11 +2800,34 @@ class H(BaseHTTPRequestHandler):
                        "application/json")
             return
         if _gated() and not self._authed() and path not in self._PUBLIC:
-            if path in ("/", "/index.html", "/v2.html"):  # gated + locked -> show the unlock page
+            if path in ("/", "/index.html", "/v2.html", "/addons"):  # gated + locked -> show the unlock page
                 with open(os.path.join(WEB, "login.html"), "rb") as f:
                     self._send(200, f.read(), "text/html; charset=utf-8")
                 return
             self._send(401, b'{"error":"locked"}', "application/json")
+            return
+        if path == "/api/hu/apk":                       # the add-on APK, for a manual or AI-agent install
+            import headunit
+            q = urllib.parse.parse_qs(self.path.partition("?")[2])
+            k = (q.get("addon") or ["climate-gesture"])[0]
+            info = headunit.ADDONS.get(k) and headunit.apk_info(k)
+            if not info:
+                self._send(404, b'{"error":"no such add-on"}', "application/json"); return
+            with open(info["path"], "rb") as f:
+                self._send(200, f.read(), "application/vnd.android.package-archive",
+                           {"Content-Disposition": 'attachment; filename="%s"' % headunit.ADDONS[k]["apk"]})
+            return
+        if path == "/api/hu/addons":                    # head unit add-ons this server can install
+            import headunit
+            out = []
+            for k, a in headunit.ADDONS.items():
+                info = headunit.apk_info(k) or {}
+                out.append({"id": k, "name": a["name"], "pkg": a["pkg"], "tested": a["tested"],
+                            "apk": bool(info), "size": info.get("size"), "sha256": info.get("sha256")})
+            self._send(200, json.dumps({"addons": out, "demo": DEMO,
+                                        "local": self._hu_local_ok(),
+                                        "networks": [] if DEMO else headunit.networks()}).encode(),
+                       "application/json")
             return
         if path == "/api/push/status":
             if not push_configured():
@@ -2725,6 +2897,32 @@ class H(BaseHTTPRequestHandler):
                 self._send(404, b'{"error":"no such receipt"}', "application/json"); return
             mime, blob = found
             self._send(200, blob, mime)
+            return
+        if path == "/api/stream":                      # realtime: a summary each time the car pushes
+            _stream_start()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                self.wfile.write(b"retry: 3000\n\n")
+                with _stream_cv:
+                    seq, body = _stream_state["seq"], _stream_state["body"]
+                if body is None:                       # watcher hasn't published yet
+                    body = json.dumps(summary()).encode()
+                while True:
+                    if body is not None:
+                        self.wfile.write(b"data: " + body + b"\n\n"); self.wfile.flush()
+                        body = None
+                    with _stream_cv:
+                        _stream_cv.wait_for(lambda: _stream_state["seq"] != seq, timeout=STREAM_PING)
+                        if _stream_state["seq"] != seq:
+                            seq, body = _stream_state["seq"], _stream_state["body"]
+                    if body is None:
+                        self.wfile.write(b": ping\n\n"); self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass                                   # tab closed
             return
         if path == "/api/controls":                    # what this car supports + opcodes to test
             if not self._authed():
@@ -2864,6 +3062,8 @@ class H(BaseHTTPRequestHandler):
                 res = {"ok": False, "error": str(e)[:180]}
             self._send(200, json.dumps(res).encode(), "application/json")
             return
+        if path in ("/addons", "/addons.html"):      # add-ons only: v2's head unit page, no car account needed
+            path = "/v2.html"
         if path == "/":
             if not is_configured():
                 path = "/login.html"                          # first run -> login page
@@ -2874,7 +3074,7 @@ class H(BaseHTTPRequestHandler):
                     part = part.strip()
                     if part.startswith("ui="):
                         ui = part[3:]
-                path = "/v2.html" if ui == "v2" else "/index.html"
+                path = "/index.html" if ui == "v1" else "/v2.html"   # v2 is the default since Nov 2026
         fp = os.path.normpath(os.path.join(WEB, path.lstrip("/")))
         if not fp.startswith(os.path.abspath(WEB)) or not os.path.isfile(fp):
             self._send(404, b"not found", "text/plain")
@@ -3050,6 +3250,10 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/charges/prices":
             self._price_write(path); return
         if path == "/api/login":
+            # public only for the first run; once set up and password-gated, re-pointing the dashboard
+            # at another account (and minting a session) needs an unlocked session first
+            if is_configured() and _gated() and not self._authed():
+                self._send(401, b'{"ok":false,"error":"Unlock the dashboard first."}', "application/json"); return
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(n).decode() or "{}")
@@ -3087,6 +3291,24 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_exception("%s %s failed" % (self.command, path), e)
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:120]}).encode(), "application/json")
+            return
+        if path == "/api/relogin":                     # banner "try now": one guarded login attempt
+            if not self._authed():
+                self._send(401, b'{"ok":false,"error":"auth"}', "application/json"); return
+            if "application/json" not in (self.headers.get("Content-Type") or ""):
+                self._send(415, b'{"ok":false,"error":"JSON only"}', "application/json"); return
+            import auth
+            err = None
+            if DEMO:
+                err = "Not available in demo mode."
+            else:
+                try:
+                    auth.login(retry=True)              # skips backoff/block, still capped per hour
+                except Exception as e:
+                    err = str(e)[:200]
+            self._send(200, json.dumps({"ok": err is None, "error": err,
+                                        "login_guard": None if DEMO else auth.login_status()}).encode(),
+                       "application/json")
             return
         if path == "/api/forcerefresh":                # poke the car with the benign init (0x77) so it
             if not self._authed():                     # reports now; the client then re-reads the DB.
@@ -3173,6 +3395,8 @@ class H(BaseHTTPRequestHandler):
                 res = {"ok": False, "error": str(e)[:180]}
             self._send(200, json.dumps(res).encode(), "application/json")
             return
+        if path.startswith("/api/hu/"):                # head unit add-ons: find + install over local ADB
+            self._head_unit(path[8:]); return
         if path == "/api/photorefresh":                # re-grab this car's render from CarLinko
             if not self._authed():
                 self._send(401, b'{"ok":false,"error":"auth"}', "application/json"); return
